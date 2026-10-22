@@ -6,6 +6,8 @@ A 720P Windows screen recorder with **scheduled start**, **scheduled stop**, **p
 
 中文界面：[screenshots/ui_zh.png](screenshots/ui_zh.png)
 
+**Download:** [RecordOnTime v1.1.1 — GitHub Releases](https://github.com/vinbo/RecordOnTime/releases/latest)
+
 ## Highlights
 
 - **Bilingual UI** — English by default, one-click switch to Chinese. The choice is remembered.
@@ -19,7 +21,7 @@ A 720P Windows screen recorder with **scheduled start**, **scheduled stop**, **p
 
 ## Quick start
 
-1. Extract `RecordOnTime_v1.1.1_win64.zip` — keep the whole folder.
+1. Download [RecordOnTime_v1.1.1_win64.zip](https://github.com/vinbo/RecordOnTime/releases/download/v1.1.1/RecordOnTime_v1.1.1_win64.zip) and extract the whole folder.
 2. Run `RecordOnTime.exe`.
 3. Choose a display, audio source and output folder.
 4. Pick **Now** or **Scheduled**, set **Duration / End time / Manual**, then click the red button.
