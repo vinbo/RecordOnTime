@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Build output
+build/
+dist/
+smoke_output/
+test_output*/
+
+# Local runtime data
+.appdata*/
+.tmp/
+.pip-cache/
+.tools/
+*.log
+
+# Bundled binary (downloaded by build.ps1 / shipped in the release zip)
+vendor/ffmpeg.exe
+
+# Test media
+*.mp4
+*.mkv
+*.wav
+*.tmp
+
+# OS
+Thumbs.db
+.DS_Store

@@ -1,0 +1,21 @@
+FFmpeg notice
+=============
+
+This application bundles ffmpeg.exe, version 7.1-essentials_build, built by
+Gyan Doshi / gyan.dev.
+
+FFmpeg is free software licensed under the GNU General Public License,
+version 3 or later, because this build includes GPL components such as
+libx264.
+
+Project:  https://ffmpeg.org/
+Builds:   https://www.gyan.dev/ffmpeg/builds/
+License:  https://www.gnu.org/licenses/gpl-3.0.html
+Source:   https://ffmpeg.org/download.html
+
+The FFmpeg binary is distributed WITHOUT ANY WARRANTY; without even the
+implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+See the GNU General Public License for more details.
+
+The Python application code in this folder is provided under the MIT
+License (see ../LICENSE).

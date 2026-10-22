@@ -1,0 +1,32 @@
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 1, 1, 0),
+    prodvers=(1, 1, 1, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo(
+      [
+        StringTable(
+          '080404b0',
+          [
+            StringStruct('CompanyName', 'RecordOnTime'),
+            StringStruct('FileDescription', 'RecordOnTime - 720P scheduled screen recorder'),
+            StringStruct('FileVersion', '1.1.1'),
+            StringStruct('InternalName', 'RecordOnTime'),
+            StringStruct('LegalCopyright', 'MIT License; bundled FFmpeg is GPLv3'),
+            StringStruct('OriginalFilename', 'RecordOnTime.exe'),
+            StringStruct('ProductName', 'RecordOnTime'),
+            StringStruct('ProductVersion', '1.1.1')
+          ]
+        )
+      ]
+    ),
+    VarFileInfo([VarStruct('Translation', [2052, 1200])])
+  ]
+)
