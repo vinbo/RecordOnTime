@@ -6,7 +6,7 @@ A 720P Windows screen recorder with **scheduled start**, **scheduled stop**, **p
 
 中文界面：[screenshots/ui_zh.png](screenshots/ui_zh.png)
 
-**Download:** [RecordOnTime v1.1.1 — GitHub Releases](https://github.com/vinbo/RecordOnTime/releases/latest)
+**Download:** [RecordOnTime v1.1.2 — GitHub Releases](https://github.com/vinbo/RecordOnTime/releases/latest)
 
 ## Highlights
 
@@ -21,7 +21,7 @@ A 720P Windows screen recorder with **scheduled start**, **scheduled stop**, **p
 
 ## Quick start
 
-1. Download [RecordOnTime_v1.1.1_win64.zip](https://github.com/vinbo/RecordOnTime/releases/download/v1.1.1/RecordOnTime_v1.1.1_win64.zip) and extract the whole folder.
+1. Download [RecordOnTime_v1.1.2_win64.zip](https://github.com/vinbo/RecordOnTime/releases/download/v1.1.2/RecordOnTime_v1.1.2_win64.zip) and extract the whole folder.
 2. Run `RecordOnTime.exe`.
 3. Choose a display, audio source and output folder.
 4. Pick **Now** or **Scheduled**, set **Duration / End time / Manual**, then click the red button.
@@ -67,7 +67,7 @@ The `+` button remains available while recording or paused.
 Top-right **Menu**:
 
 - **Contact author** — displays `linan138@gmail.com`; copy it or open your mail client.
-- **Donate** — displays the Alipay QR code from `assets/alipay.jpg` (a PNG copy is bundled for Tk).
+- **Donate** — displays the Alipay QR code from `assets/alipay_2.png`.
 
 ## Output
 
@@ -114,7 +114,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 Output:
 
 - `dist\RecordOnTime\RecordOnTime.exe`
-- `dist\RecordOnTime_v1.1.1_win64.zip`
+- `dist\RecordOnTime_v1.1.2_win64.zip`
 
 The PyInstaller spec is `RecordOnTime.spec`; FFmpeg is bundled as `vendor\ffmpeg.exe` (not embedded into the EXE) for fast startup. The binary is not committed to Git; `build.ps1` fetches it via `imageio-ffmpeg`, and the release ZIP includes it.
 

@@ -2466,7 +2466,7 @@ class RecorderApp(tk.Tk):
             wraplength=390,
             justify="left",
         ).pack(anchor="w", pady=(4, 8))
-        image_path = resource_path("assets/alipay.png")
+        image_path = resource_path("assets/alipay_2.png")
         try:
             self._donate_image = tk.PhotoImage(file=str(image_path))
             tk.Label(body, image=self._donate_image, bg=BG).pack(pady=(2, 4))
