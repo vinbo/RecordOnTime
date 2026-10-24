@@ -219,6 +219,10 @@ EN: dict[str, str] = {
     "磁盘剩余空间仅 {mb} MB，录制即将自动停止。": (
         "Only {mb} MB free; recording will stop automatically."
     ),
+    "输出目录不可写，临时文件已放到系统盘；保存时可能需要额外复制时间。": (
+        "The output folder is not writable; temporary files were moved to the system drive, "
+        "so saving may require an extra copy."
+    ),
     "录制器未正确初始化。": "The recorder is not initialized correctly.",
     "录制正在进行中": "A recording is already in progress.",
     "没有有效的录制片段": "No valid recording segment was produced.",

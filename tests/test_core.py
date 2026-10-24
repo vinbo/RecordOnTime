@@ -177,6 +177,15 @@ class FFmpegTests(unittest.TestCase):
         self.assertIn("pad=1280:720", text)
         self.assertIn("format=yuv420p", text)
 
+    def test_mux_does_not_rewrite_for_faststart(self):
+        command = build_mux_command(
+            self.ffmpeg,
+            self.tmp / "video.mkv",
+            [AudioTrack(self.tmp / "audio.wav", "系统声音")],
+            self.tmp / "out.mp4",
+        )
+        self.assertNotIn("+faststart", command)
+
     def test_two_audio_mux(self):
         video = self._make_video()
         audio1 = self._make_wav("a1.wav", 440)

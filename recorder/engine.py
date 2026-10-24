@@ -168,7 +168,18 @@ class RecordingEngine:
         session_dir = work_dir() / session_name
         try:
             config.output_dir.mkdir(parents=True, exist_ok=True)
-            session_dir.mkdir(parents=True, exist_ok=True)
+            # Keep the capture files on the same volume as the final MP4.  The
+            # old flow wrote to %LOCALAPPDATA% and then copied a multi-GB MP4
+            # across drives, which was the dominant cost when saving long
+            # recordings on a slower/secondary disk.
+            try:
+                output_staging = config.output_dir / ".RecordOnTime_tmp"
+                session_dir = output_staging / session_name
+                session_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                session_dir = work_dir() / session_name
+                session_dir.mkdir(parents=True, exist_ok=True)
+                self._add_warning("输出目录不可写，临时文件已放到系统盘；保存时可能需要额外复制时间。")
             self._session_dir = session_dir
             self._write_session_metadata("starting")
             self._check_disk_space(force=True)
@@ -466,6 +477,7 @@ class RecordingEngine:
             self._emit({"type": "error", "message": "录制器未正确初始化。"})
             return
 
+        finalize_started = time.monotonic()
         try:
             self._stop_current_segment()
             segments = list(self._segments)
@@ -474,10 +486,10 @@ class RecordingEngine:
 
             final_path = unique_path(config.output_dir, config.output_stem(self._started_at))
             ensure_audio = config.audio_source != AUDIO_NONE
-            parts: list[Path] = []
             audio_labels: list[str] = []
+            tracks_by_segment: list[list[AudioTrack]] = []
             active_elapsed = max(1.0, self._accumulated_active)
-            for index, segment in enumerate(segments, start=1):
+            for segment in segments:
                 tracks: list[AudioTrack] = []
                 for capture in segment.captures:
                     offset = 0.0
@@ -495,25 +507,40 @@ class RecordingEngine:
                             noise_reduction=capture.noise_reduction,
                         )
                     )
-                part = self._session_dir / f"part_{index:03d}.mp4"
+                tracks_by_segment.append(tracks)
+
+            ffmpeg = self._ffmpeg or find_ffmpeg()
+            if len(segments) == 1:
+                # Single-pass finalisation: write the MP4 directly in the output
+                # folder.  No part file, no cross-drive move, no faststart rewrite.
                 mux_recording(
-                    self._ffmpeg or find_ffmpeg(),
-                    segment.video_path,
-                    tracks,
-                    part,
+                    ffmpeg,
+                    segments[0].video_path,
+                    tracks_by_segment[0],
+                    final_path,
                     timeout=max(900.0, active_elapsed * 2),
                     ensure_audio=ensure_audio,
                 )
-                info = probe_media(part)
-                if not info.video_codec or info.width <= 0:
-                    raise FFmpegError(f"片段 {index} 缺少有效的视频轨道")
-                parts.append(part)
-
-            if len(parts) == 1:
-                shutil.move(str(parts[0]), str(final_path))
             else:
+                parts: list[Path] = []
+                for index, (segment, tracks) in enumerate(
+                    zip(segments, tracks_by_segment), start=1
+                ):
+                    part = self._session_dir / f"part_{index:03d}.mp4"
+                    mux_recording(
+                        ffmpeg,
+                        segment.video_path,
+                        tracks,
+                        part,
+                        timeout=max(900.0, active_elapsed * 2),
+                        ensure_audio=ensure_audio,
+                    )
+                    info = probe_media(part)
+                    if not info.video_codec or info.width <= 0:
+                        raise FFmpegError(f"片段 {index} 缺少有效的视频轨道")
+                    parts.append(part)
                 concat_mp4(
-                    self._ffmpeg or find_ffmpeg(),
+                    ffmpeg,
                     parts,
                     final_path,
                     timeout=max(900.0, active_elapsed * 2),
@@ -523,6 +550,7 @@ class RecordingEngine:
             if not info.video_codec or info.width <= 0:
                 raise FFmpegError("最终文件缺少有效的视频轨道")
             self._finished_at = datetime.now()
+            finalize_seconds = time.monotonic() - finalize_started
             result = {
                 "path": str(final_path),
                 "duration": info.duration,
@@ -534,17 +562,20 @@ class RecordingEngine:
                 "audio_codec": info.audio_codec,
                 "started_at": self._started_at.isoformat(timespec="seconds") if self._started_at else None,
                 "finished_at": self._finished_at.isoformat(timespec="seconds"),
+                "finalize_seconds": round(finalize_seconds, 2),
                 "warnings": list(self._warnings),
                 "segments": len(segments),
             }
             self._last_result = result
+            self._cleanup_session_dir()
             self._set_state(STATE_IDLE)
             self._emit({"type": "finalized", **result})
-            try:
-                shutil.rmtree(self._session_dir, ignore_errors=True)
-            except Exception:
-                pass
-            _LOG.info("Recording saved: %s (%s)", final_path, format_hms(info.duration))
+            _LOG.info(
+                "Recording saved: %s (%s, finalised in %.1fs)",
+                final_path,
+                format_hms(info.duration),
+                finalize_seconds,
+            )
         except Exception as exc:
             _LOG.exception("Recording finalisation failed")
             self._set_state(STATE_IDLE)
@@ -617,6 +648,39 @@ class RecordingEngine:
             self._warnings.append(message)
             _LOG.warning(message)
             self._emit({"type": "warning", "message": message})
+
+    def _cleanup_session_dir(self) -> None:
+        """Remove capture files, retrying briefly if antivirus still holds them."""
+        session_dir = self._session_dir
+        if session_dir is None:
+            return
+        for _ in range(8):
+            shutil.rmtree(session_dir, ignore_errors=True)
+            if not session_dir.exists():
+                break
+            try:
+                session_dir.rmdir()
+                break
+            except OSError:
+                pass
+            time.sleep(0.25)
+        if session_dir.exists():
+            try:
+                session_dir.rmdir()
+            except OSError:
+                pass
+        try:
+            parent = session_dir.parent
+            if (
+                parent.name == ".RecordOnTime_tmp"
+                and parent.exists()
+                and not any(parent.iterdir())
+            ):
+                parent.rmdir()
+        except Exception:
+            pass
+        if session_dir.exists():
+            _LOG.warning("Temporary capture files remain in %s", session_dir)
 
     def _cleanup_current_segment(self) -> None:
         with self._segment_lock:

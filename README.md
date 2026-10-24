@@ -6,7 +6,7 @@ A 720P Windows screen recorder with **scheduled start**, **scheduled stop**, **p
 
 中文界面：[screenshots/ui_zh.png](screenshots/ui_zh.png)
 
-**Download:** [RecordOnTime v1.1.2 — GitHub Releases](https://github.com/vinbo/RecordOnTime/releases/latest)
+**Download:** [RecordOnTime v1.1.3 — GitHub Releases](https://github.com/vinbo/RecordOnTime/releases/latest)
 
 ## Highlights
 
@@ -21,7 +21,7 @@ A 720P Windows screen recorder with **scheduled start**, **scheduled stop**, **p
 
 ## Quick start
 
-1. Download [RecordOnTime_v1.1.2_win64.zip](https://github.com/vinbo/RecordOnTime/releases/download/v1.1.2/RecordOnTime_v1.1.2_win64.zip) and extract the whole folder.
+1. Download [RecordOnTime_v1.1.3_win64.zip](https://github.com/vinbo/RecordOnTime/releases/download/v1.1.3/RecordOnTime_v1.1.3_win64.zip) and extract the whole folder.
 2. Run `RecordOnTime.exe`.
 3. Choose a display, audio source and output folder.
 4. Pick **Now** or **Scheduled**, set **Duration / End time / Manual**, then click the red button.
@@ -73,13 +73,23 @@ Top-right **Menu**:
 
 | Item | Value |
 |---|---|
-| Container | MP4 (`+faststart`) |
+| Container | MP4 (standard, no faststart — finalizes much faster) |
 | Video | H.264 High Profile, 1280×720, 30 FPS, yuv420p, CRF 19 |
 | Audio | AAC-LC, 48 kHz, stereo, 192 kbps |
 | Aspect ratio | Preserved, letterboxed to exactly 1280×720 |
 | Temporary format | MKV segments while recording; MP4 when finished |
 
 Recordings go to the selected folder (default `%USERPROFILE%\Videos\RecordOnTime`). The file name uses the prefix and the session start time, e.g. `Recording_2026-10-22_19-30-00.mp4`.
+
+### Saving speed
+
+Long recordings used to spend most of their stop time copying the finished MP4 from `%LOCALAPPDATA%` to the output folder, plus a `+faststart` rewrite of the whole file. v1.1.3 avoids both:
+
+- capture files are written to `<output folder>\.RecordOnTime_tmp\` (same volume as the final file);
+- a single-segment recording is muxed **directly** to its final MP4 (no part file, no cross-drive move);
+- MP4 is written without `faststart`, so the muxer does not rewrite the file a second time. The file plays normally; remux with `-movflags +faststart` only if you need progressive web playback.
+
+In a local benchmark, finalizing a 30-minute 1280×720 / 2 GB file (video copy + AAC audio) took about 10 seconds instead of being dominated by a cross-drive copy.
 
 ## How it works
 
@@ -96,8 +106,10 @@ Recordings go to the selected folder (default `%USERPROFILE%\Videos\RecordOnTime
 |---|---|
 | Settings | `%APPDATA%\RecordOnTime\settings.json` |
 | Logs | `%APPDATA%\RecordOnTime\logs\app.log` |
-| Temporary segments | `%LOCALAPPDATA%\RecordOnTime\work\` |
+| Temporary segments | `<output folder>\.RecordOnTime_tmp\` (same volume as the final MP4) |
 | Default output | `%USERPROFILE%\Videos\RecordOnTime\` |
+
+Temporary capture files are written to the output folder so the finished MP4 does not have to be copied across drives. If that folder is not writable, the app falls back to `%LOCALAPPDATA%\RecordOnTime\work\` and shows a warning.
 
 Portable mode: create an empty `portable.flag` next to the EXE to keep settings, logs and temporary files under `userdata\`.
 
@@ -114,7 +126,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 Output:
 
 - `dist\RecordOnTime\RecordOnTime.exe`
-- `dist\RecordOnTime_v1.1.2_win64.zip`
+- `dist\RecordOnTime_v1.1.3_win64.zip`
 
 The PyInstaller spec is `RecordOnTime.spec`; FFmpeg is bundled as `vendor\ffmpeg.exe` (not embedded into the EXE) for fast startup. The binary is not committed to Git; `build.ps1` fetches it via `imageio-ffmpeg`, and the release ZIP includes it.
 
@@ -146,7 +158,7 @@ The suite covers time parsing, settings, FFmpeg command construction, two-track 
 - Locking the screen can produce a black recording; DRM/protected video and WASAPI-exclusive players may also be black/silent.
 - If system audio is missing, confirm the default playback device and disable exclusive mode in the player.
 - If microphone audio is missing, check Windows microphone privacy settings and refresh the device list.
-- A failed finalization leaves the MKV/WAV segments in `%LOCALAPPDATA%\RecordOnTime\work\`; they can be muxed manually with FFmpeg.
+- A failed finalization leaves the MKV/WAV segments in `<output folder>\.RecordOnTime_tmp\` (or `%LOCALAPPDATA%\RecordOnTime\work\` if the output folder was not writable); they can be muxed manually with FFmpeg.
 - The app is completely local and does not upload anything.
 
 ## License

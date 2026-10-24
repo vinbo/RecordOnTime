@@ -357,8 +357,6 @@ def build_mux_command(
         [
             "-c:v",
             "copy",
-            "-movflags",
-            "+faststart",
             "-metadata",
             f"title={title}",
             "-metadata",
@@ -460,8 +458,6 @@ def concat_mp4(
         str(list_path),
         "-c",
         "copy",
-        "-movflags",
-        "+faststart",
         "-f",
         "mp4",
         str(output),
