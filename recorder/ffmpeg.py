@@ -304,6 +304,42 @@ def _audio_chain(index: int, track: AudioTrack, out_label: str) -> str:
     return ",".join(parts) + f"[{out_label}]"
 
 
+_AAC_ENCODER_CACHE: dict[str, str] = {}
+
+
+def select_aac_encoder(ffmpeg: Path) -> str:
+    """Return the fastest available AAC encoder.
+
+    The native FFmpeg AAC encoder is single-threaded and takes ~45-50 s for
+    thirty minutes of real (non-silent) audio, which dominated finalization.
+    Windows Media Foundation's AAC encoder is several times faster for the
+    same stereo/48 kHz output.  Fall back to the native encoder if the build
+    or Windows edition does not provide it.
+    """
+    key = str(ffmpeg)
+    cached = _AAC_ENCODER_CACHE.get(key)
+    if cached is not None:
+        return cached
+    encoder = "aac"
+    try:
+        result = subprocess.run(
+            [str(ffmpeg), "-hide_banner", "-encoders"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=20,
+            creationflags=_CREATE_NO_WINDOW,
+            startupinfo=_startupinfo(),
+        )
+        listing = (result.stdout or b"").decode("utf-8", "replace")
+        if " aac_mf " in f" {listing} ":
+            encoder = "aac_mf"
+    except Exception:
+        _LOG.debug("Could not query AAC encoders; using native AAC", exc_info=True)
+    _AAC_ENCODER_CACHE[key] = encoder
+    _LOG.info("Using AAC encoder: %s", encoder)
+    return encoder
+
+
 def build_mux_command(
     ffmpeg: Path,
     video: Path,
@@ -313,6 +349,7 @@ def build_mux_command(
     title: str = "RecordOnTime",
     pad_to: float | None = None,
     ensure_audio: bool = False,
+    audio_encoder: str = "aac",
 ) -> list[str]:
     command = [str(ffmpeg), "-hide_banner", "-loglevel", "warning", "-nostats", "-y", "-i", str(video)]
     for track in tracks:
@@ -334,7 +371,11 @@ def build_mux_command(
             )
         command.extend(["-filter_complex", ";".join(chains)])
         command.extend(["-map", "0:v:0", "-map", "[aud]"])
-        command.extend(["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"])
+        command.extend(["-c:a", audio_encoder, "-b:a", "192k", "-ar", "48000", "-ac", "2"])
+        if audio_encoder == "aac":
+            # Native AAC's default two-loop coder is slow on long, non-silent
+            # audio; the fast coder halves the time if aac_mf is unavailable.
+            command.extend(["-aac_coder", "fast"])
         command.extend(["-shortest"])
     elif ensure_audio:
         # Every segment must carry the same stream layout so paused/resumed
@@ -349,7 +390,9 @@ def build_mux_command(
             ]
         )
         command.extend(["-map", "0:v:0", "-map", "[aud]"])
-        command.extend(["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"])
+        command.extend(["-c:a", audio_encoder, "-b:a", "192k", "-ar", "48000", "-ac", "2"])
+        if audio_encoder == "aac":
+            command.extend(["-aac_coder", "fast"])
         command.extend(["-shortest"])
     else:
         command.extend(["-map", "0:v:0", "-an"])
@@ -387,43 +430,59 @@ def mux_recording(
             pad_to = duration
     except Exception:
         _LOG.debug("Could not probe video duration before mux", exc_info=True)
-    command = build_mux_command(
-        ffmpeg,
-        video,
-        tracks,
-        output,
-        title=title,
-        pad_to=pad_to,
-        ensure_audio=ensure_audio,
-    )
-    _LOG.info("Finalising MP4: %s", subprocess.list2cmdline(command))
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        creationflags=_CREATE_NO_WINDOW,
-        startupinfo=_startupinfo(),
-    )
-    try:
-        _, stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.communicate()
-        raise FFmpegError("生成 MP4 超时")
-    if process.returncode != 0:
-        detail = (stderr or b"").decode("utf-8", "replace").strip()
+    encoder = select_aac_encoder(ffmpeg)
+    attempts = [encoder]
+    if encoder != "aac":
+        attempts.append("aac")
+    last_error = ""
+    for attempt in attempts:
+        command = build_mux_command(
+            ffmpeg,
+            video,
+            tracks,
+            output,
+            title=title,
+            pad_to=pad_to,
+            ensure_audio=ensure_audio,
+            audio_encoder=attempt,
+        )
+        _LOG.info("Finalising MP4: %s", subprocess.list2cmdline(command))
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            creationflags=_CREATE_NO_WINDOW,
+            startupinfo=_startupinfo(),
+        )
+        try:
+            _, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            try:
+                output.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise FFmpegError("生成 MP4 超时")
+        if process.returncode == 0 and output.exists() and output.stat().st_size >= 1024:
+            return
+        last_error = (stderr or b"").decode("utf-8", "replace").strip()
         try:
             output.unlink(missing_ok=True)
         except Exception:
             pass
-        raise FFmpegError(f"生成 MP4 失败（退出码 {process.returncode}）。{detail[-1500:]}")
-    if not output.exists() or output.stat().st_size < 1024:
-        try:
-            output.unlink(missing_ok=True)
-        except Exception:
-            pass
-        raise FFmpegError("生成的 MP4 文件无效")
+        if attempt != attempts[-1]:
+            _LOG.warning(
+                "AAC encoder %s failed; retrying with native AAC: %s",
+                attempt,
+                last_error[-500:],
+            )
+            continue
+        break
+    if last_error:
+        raise FFmpegError(f"生成 MP4 失败。{last_error[-1500:]}")
+    raise FFmpegError("生成的 MP4 文件无效")
 
 
 def concat_mp4(

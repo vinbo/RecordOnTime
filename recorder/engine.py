@@ -550,6 +550,7 @@ class RecordingEngine:
             if not info.video_codec or info.width <= 0:
                 raise FFmpegError("最终文件缺少有效的视频轨道")
             self._finished_at = datetime.now()
+            self._cleanup_session_dir()
             finalize_seconds = time.monotonic() - finalize_started
             result = {
                 "path": str(final_path),
@@ -567,7 +568,6 @@ class RecordingEngine:
                 "segments": len(segments),
             }
             self._last_result = result
-            self._cleanup_session_dir()
             self._set_state(STATE_IDLE)
             self._emit({"type": "finalized", **result})
             _LOG.info(

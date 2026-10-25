@@ -6,7 +6,7 @@ A 720P Windows screen recorder with **scheduled start**, **scheduled stop**, **p
 
 中文界面：[screenshots/ui_zh.png](screenshots/ui_zh.png)
 
-**Download:** [RecordOnTime v1.1.3 — GitHub Releases](https://github.com/vinbo/RecordOnTime/releases/latest)
+**Download:** [RecordOnTime v1.1.4 — GitHub Releases](https://github.com/vinbo/RecordOnTime/releases/latest)
 
 ## Highlights
 
@@ -21,7 +21,7 @@ A 720P Windows screen recorder with **scheduled start**, **scheduled stop**, **p
 
 ## Quick start
 
-1. Download [RecordOnTime_v1.1.3_win64.zip](https://github.com/vinbo/RecordOnTime/releases/download/v1.1.3/RecordOnTime_v1.1.3_win64.zip) and extract the whole folder.
+1. Download [RecordOnTime_v1.1.4_win64.zip](https://github.com/vinbo/RecordOnTime/releases/download/v1.1.4/RecordOnTime_v1.1.4_win64.zip) and extract the whole folder.
 2. Run `RecordOnTime.exe`.
 3. Choose a display, audio source and output folder.
 4. Pick **Now** or **Scheduled**, set **Duration / End time / Manual**, then click the red button.
@@ -75,7 +75,7 @@ Top-right **Menu**:
 |---|---|
 | Container | MP4 (standard, no faststart — finalizes much faster) |
 | Video | H.264 High Profile, 1280×720, 30 FPS, yuv420p, CRF 19 |
-| Audio | AAC-LC, 48 kHz, stereo, 192 kbps |
+| Audio | AAC-LC 48 kHz stereo 192 kbps (Windows Media Foundation encoder, native fallback) |
 | Aspect ratio | Preserved, letterboxed to exactly 1280×720 |
 | Temporary format | MKV segments while recording; MP4 when finished |
 
@@ -83,13 +83,20 @@ Recordings go to the selected folder (default `%USERPROFILE%\Videos\RecordOnTime
 
 ### Saving speed
 
-Long recordings used to spend most of their stop time copying the finished MP4 from `%LOCALAPPDATA%` to the output folder, plus a `+faststart` rewrite of the whole file. v1.1.3 avoids both:
+Three things used to dominate stop time:
 
+1. the native FFmpeg AAC encoder — about **50 seconds** for 30 minutes of real (non-silent) audio, even though it was fast on silence;
+2. copying the finished MP4 from `%LOCALAPPDATA%` to the output folder when they were on different drives;
+3. the `+faststart` rewrite of the whole MP4.
+
+v1.1.4 addresses all three:
+
+- audio is encoded with **Windows Media Foundation AAC (`aac_mf`)**, with automatic fallback to native AAC (`-aac_coder fast`) if unavailable; in a 30-minute non-silent benchmark this fell from about 51 s to about 14 s;
 - capture files are written to `<output folder>\.RecordOnTime_tmp\` (same volume as the final file);
 - a single-segment recording is muxed **directly** to its final MP4 (no part file, no cross-drive move);
 - MP4 is written without `faststart`, so the muxer does not rewrite the file a second time. The file plays normally; remux with `-movflags +faststart` only if you need progressive web playback.
 
-In a local benchmark, finalizing a 30-minute 1280×720 / 2 GB file (video copy + AAC audio) took about 10 seconds instead of being dominated by a cross-drive copy.
+The file size is not the main factor: a 300 MB recording still contains 30 minutes of audio, and the old AAC path took the same time as for a much larger file.
 
 ## How it works
 
@@ -126,7 +133,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 Output:
 
 - `dist\RecordOnTime\RecordOnTime.exe`
-- `dist\RecordOnTime_v1.1.3_win64.zip`
+- `dist\RecordOnTime_v1.1.4_win64.zip`
 
 The PyInstaller spec is `RecordOnTime.spec`; FFmpeg is bundled as `vendor\ffmpeg.exe` (not embedded into the EXE) for fast startup. The binary is not committed to Git; `build.ps1` fetches it via `imageio-ffmpeg`, and the release ZIP includes it.
 

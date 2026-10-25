@@ -20,6 +20,7 @@ from recorder.ffmpeg import (
     find_ffmpeg,
     mux_recording,
     probe_media,
+    select_aac_encoder,
     video_filter,
 )
 from recorder.i18n import format_datetime, tr
@@ -185,6 +186,27 @@ class FFmpegTests(unittest.TestCase):
             self.tmp / "out.mp4",
         )
         self.assertNotIn("+faststart", command)
+
+    def test_aac_encoder_selection_and_command(self):
+        encoder = select_aac_encoder(self.ffmpeg)
+        self.assertIn(encoder, ("aac_mf", "aac"))
+        command = build_mux_command(
+            self.ffmpeg,
+            self.tmp / "video.mkv",
+            [AudioTrack(self.tmp / "audio.wav", "系统声音")],
+            self.tmp / "out.mp4",
+            audio_encoder=encoder,
+        )
+        self.assertIn(encoder, command)
+        fallback = build_mux_command(
+            self.ffmpeg,
+            self.tmp / "video.mkv",
+            [AudioTrack(self.tmp / "audio.wav", "系统声音")],
+            self.tmp / "out.mp4",
+            audio_encoder="aac",
+        )
+        self.assertIn("-aac_coder", fallback)
+        self.assertIn("fast", fallback)
 
     def test_two_audio_mux(self):
         video = self._make_video()
