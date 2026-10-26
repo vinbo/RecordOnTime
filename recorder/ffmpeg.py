@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import shutil
@@ -10,6 +11,7 @@ import subprocess
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -100,17 +102,82 @@ def _run_capture(command: list[str], timeout: float = 30.0) -> tuple[int, str]:
 def video_filter(config: RecordingConfig) -> str:
     width, height = config.width, config.height
     return (
-        f"scale={width}:{height}:force_original_aspect_ratio=decrease:flags=lanczos,"
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease:flags=bicubic,"
         f"pad={width}:{height}:floor((ow-iw)/2):floor((oh-ih)/2):color=black,"
         "setsar=1,format=yuv420p"
     )
 
 
-def build_video_command(ffmpeg: Path, config: RecordingConfig, output: Path) -> list[str]:
+_VIDEO_ENCODER_CACHE: dict[str, str] = {}
+
+
+def select_video_encoder(ffmpeg: Path) -> str:
+    """Prefer Intel Quick Sync, which cuts recording CPU sharply.
+
+    libx264 ``veryfast`` used roughly 20% CPU here; QSV encodes the same
+    720p30 stream at a few percent.  Fall back to x264 ``ultrafast`` (still
+    much lighter than veryfast) when QSV is unavailable or fails to initialise.
+    """
+    key = str(ffmpeg)
+    cached = _VIDEO_ENCODER_CACHE.get(key)
+    if cached is not None:
+        return cached
+    encoder = "libx264"
+    try:
+        result = subprocess.run(
+            [
+                str(ffmpeg),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=1280x720:r=30",
+                "-frames:v",
+                "3",
+                "-an",
+                "-c:v",
+                "h264_qsv",
+                "-global_quality",
+                "20",
+                "-look_ahead",
+                "0",
+                "-preset",
+                "veryfast",
+                "-f",
+                "null",
+                "NUL",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=20,
+            creationflags=_CREATE_NO_WINDOW,
+            startupinfo=_startupinfo(),
+        )
+        if result.returncode == 0:
+            encoder = "h264_qsv"
+    except Exception:
+        _LOG.debug("QSV probe failed", exc_info=True)
+    _VIDEO_ENCODER_CACHE[key] = encoder
+    _LOG.info("Using video encoder: %s", encoder)
+    return encoder
+
+
+def build_video_command(
+    ffmpeg: Path,
+    config: RecordingConfig,
+    output: Path,
+    *,
+    encoder: str | None = None,
+) -> list[str]:
     monitor = config.monitor
     width = max(2, monitor.width - (monitor.width % 2))
     height = max(2, monitor.height - (monitor.height % 2))
-    return [
+    encoder = encoder or select_video_encoder(ffmpeg)
+    command = [
         str(ffmpeg),
         "-hide_banner",
         "-loglevel",
@@ -138,34 +205,57 @@ def build_video_command(ffmpeg: Path, config: RecordingConfig, output: Path) -> 
         video_filter(config),
         "-r",
         str(config.fps),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "19",
-        "-pix_fmt",
-        "yuv420p",
-        "-profile:v",
-        "high",
-        "-level",
-        "3.1",
-        "-g",
-        str(config.fps * 2),
-        "-keyint_min",
-        str(config.fps),
-        "-sc_threshold",
-        "0",
-        "-colorspace",
-        "bt709",
-        "-color_primaries",
-        "bt709",
-        "-color_trc",
-        "bt709",
-        "-f",
-        "matroska",
-        str(output),
     ]
+    if encoder == "h264_qsv":
+        command.extend(
+            [
+                "-c:v",
+                "h264_qsv",
+                "-global_quality",
+                "20",
+                "-look_ahead",
+                "0",
+                "-preset",
+                "veryfast",
+            ]
+        )
+    else:
+        command.extend(
+            [
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-crf",
+                "23",
+            ]
+        )
+    command.extend(
+        [
+            "-pix_fmt",
+            "yuv420p",
+            "-profile:v",
+            "high",
+            "-level",
+            "3.1",
+            "-g",
+            str(config.fps * 2),
+            "-keyint_min",
+            str(config.fps),
+            "-sc_threshold",
+            "0",
+            "-colorspace",
+            "bt709",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "-f",
+            "matroska",
+            str(output),
+        ]
+    )
+    return command
 
 
 class VideoRecorder:
@@ -180,11 +270,14 @@ class VideoRecorder:
         self._stderr: deque[str] = deque(maxlen=120)
         self._reader: threading.Thread | None = None
         self._lock = threading.Lock()
+        self.encoder = ""
 
-    def start(self) -> None:
-        self.output.parent.mkdir(parents=True, exist_ok=True)
-        self.command = build_video_command(self.ffmpeg, self.config, self.output)
+    def _spawn(self, encoder: str) -> None:
+        self.encoder = encoder
+        self.command = build_video_command(self.ffmpeg, self.config, self.output, encoder=encoder)
         _LOG.info("Starting video capture: %s", subprocess.list2cmdline(self.command))
+        with self._lock:
+            self._stderr.clear()
         self.process = subprocess.Popen(
             self.command,
             stdin=subprocess.PIPE,
@@ -198,12 +291,27 @@ class VideoRecorder:
         self.started_at = time.time()
         self._reader = threading.Thread(target=self._read_stderr, name="ffmpeg-stderr", daemon=True)
         self._reader.start()
+
+    def start(self) -> None:
+        self.output.parent.mkdir(parents=True, exist_ok=True)
+        encoder = select_video_encoder(self.ffmpeg)
+        self._spawn(encoder)
         time.sleep(0.7)
         code = self.process.poll()
-        if code is not None:
+        if code is None:
+            return
+        self._reader.join(timeout=1.0)
+        detail = self.error_text()
+        if encoder != "libx264":
+            _LOG.warning("Hardware encoder %s failed; retrying with x264: %s", encoder, detail)
+            self._spawn("libx264")
+            time.sleep(0.7)
+            code = self.process.poll()
+            if code is None:
+                return
             self._reader.join(timeout=1.0)
             detail = self.error_text()
-            raise FFmpegError(f"录屏启动失败（FFmpeg 退出码 {code}）。{detail}")
+        raise FFmpegError(f"录屏启动失败（FFmpeg 退出码 {code}）。{detail}")
 
     def _read_stderr(self) -> None:
         stream = self.process.stderr if self.process else None
@@ -412,6 +520,228 @@ def build_mux_command(
     return command
 
 
+def _run_ffmpeg_process(command: list[str], timeout: float) -> None:
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        creationflags=_CREATE_NO_WINDOW,
+        startupinfo=_startupinfo(),
+    )
+    try:
+        _, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+        raise FFmpegError("FFmpeg 处理超时")
+    if process.returncode != 0:
+        detail = (stderr or b"").decode("utf-8", "replace").strip()
+        raise FFmpegError(f"FFmpeg 处理失败（退出码 {process.returncode}）。{detail[-1500:]}")
+
+
+def _parallel_audio_mux(
+    ffmpeg: Path,
+    video: Path,
+    track: AudioTrack,
+    output: Path,
+    *,
+    duration: float,
+    temp_dir: Path,
+    title: str,
+    timeout: float,
+) -> None:
+    """Encode 1 h+ of audio as four 30-minute AAC chunks concurrently.
+
+    aac_mf takes ~14 s per 30 minutes on this machine.  A single 2 h audio
+    encode would still take ~56 s, so split the timeline and run up to four
+    Media Foundation encoders in parallel, then mux the video with -c:a copy.
+    This fast path is limited to one audio track; multi-track recordings keep
+    the filter/mix path below.
+    """
+    audio_duration = probe_media(track.path, ffmpeg).duration
+    if audio_duration <= 0.1:
+        raise FFmpegError("音频文件没有有效时长")
+    chunk_count = min(4, max(2, math.ceil(duration / 1800.0)))
+    chunk_len = duration / chunk_count
+    encoder = select_aac_encoder(ffmpeg)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    chunks: list[Path] = []
+    jobs: list[tuple[Path, list[str], float]] = []
+    offset = track.offset_seconds
+    for index in range(chunk_count):
+        start = index * chunk_len
+        end = duration if index == chunk_count - 1 else min(duration, (index + 1) * chunk_len)
+        length = max(0.1, end - start)
+        chunk = temp_dir / f"audio_{index:03d}.m4a"
+        chunks.append(chunk)
+        # Keep the recording timeline: positive offset means the track starts
+        # late; negative offset means leading audio was captured before video.
+        delay = 0.0
+        if offset >= 0:
+            if start >= offset:
+                src_start = start - offset
+                read_dur = length
+            else:
+                src_start = 0.0
+                delay = offset - start
+                read_dur = max(0.0, length - delay)
+        else:
+            src_start = max(0.0, start - offset)
+            read_dur = length
+        if read_dur <= 0.05 or src_start >= audio_duration - 0.05:
+            command = [
+                str(ffmpeg),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=48000:cl=stereo",
+                "-t",
+                f"{length:.3f}",
+                "-c:a",
+                encoder,
+                "-b:a",
+                "192k",
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
+                "-f",
+                "mp4",
+                str(chunk),
+            ]
+        else:
+            filters = [
+                "aresample=48000",
+                "aformat=sample_fmts=fltp:channel_layouts=stereo",
+            ]
+            if track.noise_reduction:
+                filters.append("afftdn=nr=8:nf=-32")
+            filters.extend(
+                [
+                    "highpass=f=70",
+                    "dynaudnorm=f=250:g=15:p=0.9",
+                    "alimiter=limit=0.95",
+                ]
+            )
+            if delay > 0.005:
+                filters.append(f"adelay={int(round(delay * 1000))}:all=1")
+            filters.append(f"atrim=duration={length:.3f},asetpts=PTS-STARTPTS")
+            filters.append(f"apad=whole_dur={length + 0.15:.3f}")
+            command = [
+                str(ffmpeg),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-ss",
+                f"{src_start:.3f}",
+                "-t",
+                f"{read_dur + 0.15:.3f}",
+                "-i",
+                str(track.path),
+                "-af",
+                ",".join(filters),
+                "-t",
+                f"{length:.3f}",
+                "-c:a",
+                encoder,
+                "-b:a",
+                "192k",
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
+                "-f",
+                "mp4",
+                str(chunk),
+            ]
+        jobs.append((chunk, command, max(600.0, length * 1.5)))
+
+    _LOG.info(
+        "Encoding %d audio chunks in parallel (%s, %.1fs each)",
+        chunk_count,
+        encoder,
+        chunk_len,
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=min(4, chunk_count)) as pool:
+            futures = [pool.submit(_run_ffmpeg_process, command, job_timeout) for _, command, job_timeout in jobs]
+            for future in as_completed(futures):
+                future.result()
+
+        audio_full = temp_dir / "audio_full.m4a"
+        list_path = temp_dir / "audio_parts.txt"
+        list_path.write_text(
+            "".join(f"file '{chunk.resolve().as_posix()}'\n" for chunk in chunks),
+            encoding="utf-8",
+        )
+        _run_ffmpeg_process(
+            [
+                str(ffmpeg),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(list_path),
+                "-c",
+                "copy",
+                "-f",
+                "mp4",
+                str(audio_full),
+            ],
+            timeout=max(60.0, duration * 0.2),
+        )
+        _run_ffmpeg_process(
+            [
+                str(ffmpeg),
+                "-hide_banner",
+                "-loglevel",
+                "warning",
+                "-nostats",
+                "-y",
+                "-i",
+                str(video),
+                "-i",
+                str(audio_full),
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c:v",
+                "copy",
+                "-c:a",
+                "copy",
+                "-shortest",
+                "-metadata",
+                f"title={title}",
+                "-metadata",
+                "comment=Created by RecordOnTime",
+                "-f",
+                "mp4",
+                str(output),
+            ],
+            timeout=timeout,
+        )
+        if not output.exists() or output.stat().st_size < 1024:
+            raise FFmpegError("并行音频生成的 MP4 文件无效")
+    finally:
+        for path in [*chunks, audio_full, temp_dir / "audio_parts.txt"]:
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
 def mux_recording(
     ffmpeg: Path,
     video: Path,
@@ -421,6 +751,7 @@ def mux_recording(
     title: str = "RecordOnTime",
     timeout: float = 3600.0,
     ensure_audio: bool = False,
+    temp_dir: Path | None = None,
 ) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     pad_to = None
@@ -430,6 +761,31 @@ def mux_recording(
             pad_to = duration
     except Exception:
         _LOG.debug("Could not probe video duration before mux", exc_info=True)
+        duration = 0.0
+    if (
+        len(tracks) == 1
+        and duration >= 3600.0
+        and tracks[0].path.exists()
+        and not os.environ.get("SCREEN_RECORDER_NO_PARALLEL_AUDIO")
+    ):
+        try:
+            _parallel_audio_mux(
+                ffmpeg,
+                video,
+                tracks[0],
+                output,
+                duration=duration,
+                temp_dir=temp_dir or output.parent,
+                title=title,
+                timeout=timeout,
+            )
+            return
+        except Exception:
+            _LOG.exception("Parallel audio finalisation failed; falling back to single pass")
+            try:
+                output.unlink(missing_ok=True)
+            except Exception:
+                pass
     encoder = select_aac_encoder(ffmpeg)
     attempts = [encoder]
     if encoder != "aac":

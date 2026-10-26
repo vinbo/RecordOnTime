@@ -520,6 +520,7 @@ class RecordingEngine:
                     final_path,
                     timeout=max(900.0, active_elapsed * 2),
                     ensure_audio=ensure_audio,
+                    temp_dir=self._session_dir,
                 )
             else:
                 parts: list[Path] = []
@@ -534,6 +535,7 @@ class RecordingEngine:
                         part,
                         timeout=max(900.0, active_elapsed * 2),
                         ensure_audio=ensure_audio,
+                        temp_dir=self._session_dir,
                     )
                     info = probe_media(part)
                     if not info.video_codec or info.width <= 0:

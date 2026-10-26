@@ -7,6 +7,7 @@ import unittest
 import wave
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parent.parent
 os.environ.setdefault("SCREEN_RECORDER_DATA_DIR", str(ROOT / ".appdata_test"))
@@ -15,6 +16,7 @@ from recorder.config import AppSettings, RoundPlan
 from recorder.ffmpeg import (
     AudioTrack,
     build_mux_command,
+    build_video_command,
     concat_mp4,
     decode_check,
     find_ffmpeg,
@@ -207,6 +209,25 @@ class FFmpegTests(unittest.TestCase):
         )
         self.assertIn("-aac_coder", fallback)
         self.assertIn("fast", fallback)
+
+    def test_video_encoder_commands(self):
+        config = SimpleNamespace(
+            monitor=SimpleNamespace(left=0, top=0, width=1920, height=1080),
+            fps=30,
+            capture_cursor=True,
+            width=1280,
+            height=720,
+        )
+        qsv = build_video_command(
+            self.ffmpeg, config, self.tmp / "qsv.mkv", encoder="h264_qsv"
+        )
+        self.assertIn("h264_qsv", qsv)
+        self.assertIn("-global_quality", qsv)
+        x264 = build_video_command(
+            self.ffmpeg, config, self.tmp / "x264.mkv", encoder="libx264"
+        )
+        self.assertIn("ultrafast", x264)
+        self.assertIn("23", x264)
 
     def test_two_audio_mux(self):
         video = self._make_video()
