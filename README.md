@@ -6,7 +6,7 @@ A 720P Windows screen recorder with **scheduled start**, **scheduled stop**, **p
 
 中文界面：[screenshots/ui_zh.png](screenshots/ui_zh.png)
 
-**Download:** [RecordOnTime_v1.1.5_win64.zip](dist/RecordOnTime_v1.1.5_win64.zip) (local build)
+**Download:** [RecordOnTime_v1.1.6_win64.zip](dist/RecordOnTime_v1.1.6_win64.zip) (local build)
 
 ## Highlights
 
@@ -21,7 +21,7 @@ A 720P Windows screen recorder with **scheduled start**, **scheduled stop**, **p
 
 ## Quick start
 
-1. Download [RecordOnTime_v1.1.5_win64.zip](dist/RecordOnTime_v1.1.5_win64.zip) and extract the whole folder.
+1. Download [RecordOnTime_v1.1.6_win64.zip](dist/RecordOnTime_v1.1.6_win64.zip) and extract the whole folder.
 2. Run `RecordOnTime.exe`.
 3. Choose a display, audio source and output folder.
 4. Pick **Now** or **Scheduled**, set **Duration / End time / Manual**, then click the red button.
@@ -83,7 +83,7 @@ Recordings go to the selected folder (default `%USERPROFILE%\Videos\RecordOnTime
 
 ### Recording CPU
 
-The old encoder was libx264 `veryfast` (CRF 19) and could exceed 20% CPU. v1.1.5 uses a GPU path on supported 16:9 monitors:
+The old encoder was libx264 `veryfast` (CRF 19) and could exceed 20% CPU. v1.1.6 uses a GPU path on supported 16:9 monitors:
 
 - **Desktop Duplication (`ddagrab`) + Intel Quick Sync** keeps frames on the GPU, with hardware scaling to 1280×720;
 - measured recording CPU on this machine: about **1–2%**, versus about 20% for the old x264 path;
@@ -102,7 +102,7 @@ Four things used to dominate stop time:
 3. copying the finished MP4 across drives;
 4. the `+faststart` rewrite of the whole MP4.
 
-v1.1.5 addresses them:
+v1.1.6 addresses them:
 
 - audio uses **Windows Media Foundation AAC (`aac_mf`)** (native AAC with `-aac_coder fast` as fallback);
 - for single-track recordings of **1 hour or longer**, the audio timeline is split into up to four chunks encoded **in parallel**, then concatenated with `-c:a copy`;
@@ -148,7 +148,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 Output:
 
 - `dist\RecordOnTime\RecordOnTime.exe`
-- `dist\RecordOnTime_v1.1.5_win64.zip`
+- `dist\RecordOnTime_v1.1.6_win64.zip`
 
 The PyInstaller spec is `RecordOnTime.spec`; FFmpeg is bundled as `vendor\ffmpeg.exe` (not embedded into the EXE) for fast startup. The binary is not committed to Git; `build.ps1` fetches it via `imageio-ffmpeg`, and the release ZIP includes it.
 
