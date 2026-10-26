@@ -212,7 +212,7 @@ class FFmpegTests(unittest.TestCase):
 
     def test_video_encoder_commands(self):
         config = SimpleNamespace(
-            monitor=SimpleNamespace(left=0, top=0, width=1920, height=1080),
+            monitor=SimpleNamespace(index=0, left=0, top=0, width=1920, height=1080),
             fps=30,
             capture_cursor=True,
             width=1280,
@@ -222,7 +222,13 @@ class FFmpegTests(unittest.TestCase):
             self.ffmpeg, config, self.tmp / "qsv.mkv", encoder="h264_qsv"
         )
         self.assertIn("h264_qsv", qsv)
-        self.assertIn("-global_quality", qsv)
+        self.assertTrue(any(str(arg).startswith("ddagrab=0") for arg in qsv))
+        self.assertTrue(any("scale_qsv" in str(arg) for arg in qsv))
+        gdi = build_video_command(
+            self.ffmpeg, config, self.tmp / "gdi.mkv", encoder="h264_qsv", source="gdigrab"
+        )
+        self.assertIn("gdigrab", gdi)
+        self.assertIn("-global_quality", gdi)
         x264 = build_video_command(
             self.ffmpeg, config, self.tmp / "x264.mkv", encoder="libx264"
         )

@@ -74,7 +74,7 @@ Top-right **Menu**:
 | Item | Value |
 |---|---|
 | Container | MP4 (standard, no faststart — finalizes much faster) |
-| Video | H.264 High Profile, 1280×720, 30 FPS, yuv420p; Intel QSV (fallback x264 ultrafast) |
+| Video | H.264 High Profile, 1280×720, 30 FPS; Desktop Duplication + QSV (fallbacks: gdigrab/QSV, x264 ultrafast) |
 | Audio | AAC-LC 48 kHz stereo 192 kbps (Windows Media Foundation encoder, native fallback) |
 | Aspect ratio | Preserved, letterboxed to exactly 1280×720 |
 | Temporary format | MKV segments while recording; MP4 when finished |
@@ -83,13 +83,15 @@ Recordings go to the selected folder (default `%USERPROFILE%\Videos\RecordOnTime
 
 ### Recording CPU
 
-The old encoder was libx264 `veryfast` (CRF 19) and could exceed 20% CPU. v1.1.5 automatically uses **Intel Quick Sync (`h264_qsv`)** when available:
+The old encoder was libx264 `veryfast` (CRF 19) and could exceed 20% CPU. v1.1.5 uses a GPU path on supported 16:9 monitors:
 
-- measured CPU while recording 1080p → 720p30: about **7%** vs about 20% for the old x264 path;
-- output is still 1280×720 H.264 at 30 FPS; QSV also produced a slightly smaller file in the local test;
-- if QSV is unavailable or fails at startup, the app falls back to x264 `ultrafast` (also much lighter than `veryfast`).
+- **Desktop Duplication (`ddagrab`) + Intel Quick Sync** keeps frames on the GPU, with hardware scaling to 1280×720;
+- measured recording CPU on this machine: about **1–2%**, versus about 20% for the old x264 path;
+- output is still 1280×720 H.264 at 30 FPS;
+- if Desktop Duplication/QSV is unavailable, it falls back to `gdigrab` + QSV (roughly 7–10%), then to x264 `ultrafast` (still much lighter than `veryfast`);
+- non-16:9 monitors use the gdigrab/QSV fallback because the hardware scaler path does not letterbox.
 
-The software scaler now uses bicubic instead of the more expensive Lanczos filter.
+The software scaler for the fallback path uses bicubic instead of the more expensive Lanczos filter.
 
 ### Saving speed
 
@@ -114,7 +116,7 @@ The parallel-audio fast path applies to a single audio track (the normal system-
 ## How it works
 
 - Python 3.11 + Tkinter UI.
-- FFmpeg `gdigrab` for video; Intel QSV (or x264 ultrafast fallback), 720P.
+- FFmpeg `ddagrab` (Desktop Duplication) with QSV hardware scaling/encoding; `gdigrab` + QSV or x264 ultrafast fallback, 720P.
 - PyAudioWPatch / PortAudio WASAPI loopback for system sound, plus optional microphone. Each source is written to a WAV with monotonic start offsets.
 - Pause/resume creates numbered MKV/WAV segments. At stop time each segment is muxed to MP4 with identical streams and concatenated with FFmpeg’s concat demuxer (`-c copy`).
 - An independent watchdog thread enforces `stop_at`, so auto-stop works even if the UI is briefly busy.
