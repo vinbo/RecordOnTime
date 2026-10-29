@@ -534,8 +534,10 @@ class DirectRecorder:
                     target = int((time.monotonic() - wall_start) * bytes_per_second) + base_bytes
                     if target > written:
                         pad = min(target - written, bytes_per_second // 20)
-                        self.process.stdin.write(b"\x00" * pad)
-                        written += pad
+                        pad -= pad % frame_bytes
+                        if pad > 0:
+                            self.process.stdin.write(b"\x00" * pad)
+                            written += pad
                     time.sleep(0.01)
                 else:
                     self.process.stdin.write(data)
