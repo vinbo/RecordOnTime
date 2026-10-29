@@ -17,6 +17,7 @@ from .audio import AudioCapture, AudioError, SilentKeepAlive, find_microphone, l
 from .config import AUDIO_BOTH, AUDIO_MIC, AUDIO_NONE, AUDIO_SYSTEM, RecordingConfig
 from .ffmpeg import (
     AudioTrack,
+    DirectRecorder,
     FFmpegError,
     VideoRecorder,
     concat_mp4,
@@ -44,6 +45,7 @@ class SegmentResult:
     video_started_monotonic: float
     video_started_at: datetime
     captures: list[AudioCapture] = field(default_factory=list)
+    direct: bool = False
 
     @property
     def duration(self) -> float:
@@ -67,9 +69,10 @@ class RecordingEngine:
         self._watch_thread: threading.Thread | None = None
         self._watch_stop = threading.Event()
         self._finishing = False
-        self._video: VideoRecorder | None = None
+        self._video: VideoRecorder | DirectRecorder | None = None
         self._audio: list[AudioCapture] = []
         self._keepalive: SilentKeepAlive | None = None
+        self._direct_enabled = True
         self._segments: list[SegmentResult] = []
         self._segment_index = 0
         self._segment_active_started: float | None = None
@@ -105,6 +108,24 @@ class RecordingEngine:
     def stop_at(self) -> datetime | None:
         cfg = self._config
         return cfg.stop_at if cfg else None
+
+    def set_stop_at(self, stop_at: datetime | None) -> None:
+        """Change the end mode/clock while recording."""
+        with self._lock:
+            if self._config is None:
+                return
+            self._config.stop_at = stop_at
+            state = self._state
+        _LOG.info("Recording stop_at changed to %s", stop_at)
+        self._emit(
+            {
+                "type": "stop_at_changed",
+                "stop_at": stop_at.isoformat(timespec="seconds") if stop_at else None,
+            }
+        )
+        if stop_at is not None and state in (STATE_RECORDING, STATE_PAUSED):
+            if datetime.now() >= stop_at:
+                self.stop()
 
     @property
     def last_result(self) -> dict | None:
@@ -150,6 +171,7 @@ class RecordingEngine:
             self._session_dir = None
             self._video = None
             self._audio = []
+            self._direct_enabled = True
             self._keepalive = None
             self._segments = []
             self._segment_index = 0
@@ -225,6 +247,81 @@ class RecordingEngine:
                 }
             )
 
+    def _can_use_direct(self) -> bool:
+        if not self._direct_enabled or self._config is None or self._inventory is None:
+            return False
+        if self._config.audio_source not in (AUDIO_SYSTEM, AUDIO_MIC):
+            return False
+        if self._config.audio_source == AUDIO_SYSTEM:
+            return self._inventory.system is not None
+        return find_microphone(self._inventory, self._config.mic_device_name) is not None
+
+    def _start_direct_segment(self) -> None:
+        """Start a one-process MP4 segment (video + live PCM audio)."""
+        config = self._config
+        session_dir = self._session_dir
+        ffmpeg = self._ffmpeg
+        inventory = self._inventory
+        assert config is not None and session_dir is not None and ffmpeg is not None and inventory is not None
+        if config.audio_source == AUDIO_SYSTEM:
+            device = inventory.system
+            label = "系统声音"
+            noise_reduction = False
+        else:
+            device = find_microphone(inventory, config.mic_device_name)
+            label = "麦克风"
+            noise_reduction = config.noise_reduction
+        if device is None:
+            raise AudioError("没有可用的音频设备")
+
+        self._segment_index += 1
+        index = self._segment_index
+        capture = AudioCapture(
+            device,
+            session_dir / f"direct_audio_{index:03d}.wav",
+            label=label,
+            noise_reduction=noise_reduction,
+            write_file=False,
+            callback_mode=True,
+        )
+        try:
+            capture.open()
+        except Exception:
+            capture.close()
+            raise
+        if config.audio_source == AUDIO_SYSTEM:
+            # The direct path does not use the silent keep-alive output stream;
+            # two simultaneous PyAudio instances plus the live encoder can
+            # destabilise some WASAPI drivers.
+            self._keepalive = None
+        recorder = DirectRecorder(
+            config,
+            session_dir / f"direct_{index:03d}.mp4",
+            capture,
+            ffmpeg=ffmpeg,
+        )
+        try:
+            recorder.start()
+        except Exception:
+            try:
+                recorder.stop(timeout=3)
+            except Exception:
+                pass
+            capture.close()
+            if self._keepalive is not None:
+                self._keepalive.stop()
+                self._keepalive = None
+            raise
+        self._video = recorder
+        self._audio = [capture]
+        self._segment_active_started = recorder.started_monotonic or time.monotonic()
+        if self._started_at is None:
+            self._started_at = (
+                datetime.fromtimestamp(recorder.started_at) if recorder.started_at else datetime.now()
+            )
+        if self._started_monotonic is None:
+            self._started_monotonic = self._segment_active_started
+
     def _start_segment(self) -> None:
         """Open audio and video for a new segment. Caller holds segment lock."""
         config = self._config
@@ -233,6 +330,14 @@ class RecordingEngine:
         inventory = self._inventory
         if config is None or session_dir is None or ffmpeg is None or inventory is None:
             raise RuntimeError("Recording engine is not initialized")
+        if self._can_use_direct():
+            try:
+                self._start_direct_segment()
+                return
+            except Exception:
+                _LOG.exception("Direct MP4 capture failed; falling back to MKV/WAV")
+                self._direct_enabled = False
+                self._cleanup_current_segment()
 
         self._segment_index += 1
         index = self._segment_index
@@ -319,11 +424,13 @@ class RecordingEngine:
                 return None
             captures = list(self._audio)
             self._audio = []
-            for capture in captures:
-                try:
-                    capture.stop()
-                except Exception:
-                    _LOG.exception("Audio stop failed")
+            direct = isinstance(video, DirectRecorder)
+            if not direct:
+                for capture in captures:
+                    try:
+                        capture.stop()
+                    except Exception:
+                        _LOG.exception("Audio stop failed")
             if self._keepalive is not None:
                 try:
                     self._keepalive.stop()
@@ -350,6 +457,7 @@ class RecordingEngine:
                     video_started_monotonic=start,
                     video_started_at=started_at,
                     captures=captures,
+                    direct=isinstance(video, DirectRecorder),
                 )
                 self._segments.append(segment)
                 self._accumulated_active += max(0.0, time.monotonic() - start)
@@ -485,6 +593,50 @@ class RecordingEngine:
                 raise FFmpegError("没有有效的录制片段")
 
             final_path = unique_path(config.output_dir, config.output_stem(self._started_at))
+            if segments and all(segment.direct for segment in segments):
+                if len(segments) == 1:
+                    # Same-volume rename: the MP4 was finalised by FFmpeg at
+                    # stop, so there is no remux or copy to wait for.
+                    shutil.move(str(segments[0].video_path), str(final_path))
+                else:
+                    concat_mp4(
+                        self._ffmpeg or find_ffmpeg(),
+                        [segment.video_path for segment in segments],
+                        final_path,
+                        timeout=max(120.0, max(1.0, self._accumulated_active) * 2),
+                    )
+                info = probe_media(final_path)
+                if not info.video_codec or info.width <= 0:
+                    raise FFmpegError("最终文件缺少有效的视频轨道")
+                self._finished_at = datetime.now()
+                self._cleanup_session_dir()
+                finalize_seconds = time.monotonic() - finalize_started
+                audio_labels = [config.audio_label] if config.audio_source != AUDIO_NONE else []
+                result = {
+                    "path": str(final_path),
+                    "duration": info.duration,
+                    "size": final_path.stat().st_size,
+                    "width": info.width,
+                    "height": info.height,
+                    "fps": info.fps,
+                    "audio": audio_labels,
+                    "audio_codec": info.audio_codec,
+                    "started_at": self._started_at.isoformat(timespec="seconds") if self._started_at else None,
+                    "finished_at": self._finished_at.isoformat(timespec="seconds"),
+                    "finalize_seconds": round(finalize_seconds, 2),
+                    "warnings": list(self._warnings),
+                    "segments": len(segments),
+                }
+                self._last_result = result
+                self._set_state(STATE_IDLE)
+                self._emit({"type": "finalized", **result})
+                _LOG.info(
+                    "Recording saved directly: %s (%s, finalised in %.1fs)",
+                    final_path,
+                    format_hms(info.duration),
+                    finalize_seconds,
+                )
+                return
             ensure_audio = config.audio_source != AUDIO_NONE
             audio_labels: list[str] = []
             tracks_by_segment: list[list[AudioTrack]] = []

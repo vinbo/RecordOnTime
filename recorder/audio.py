@@ -259,6 +259,9 @@ class AudioCapture:
         label: str,
         noise_reduction: bool = False,
         level_callback: Callable[[float], None] | None = None,
+        write_file: bool = True,
+        sink: Callable[[bytes], None] | None = None,
+        callback_mode: bool = False,
     ) -> None:
         if pyaudio is None:
             raise AudioError("未安装 PyAudioWPatch")
@@ -267,6 +270,9 @@ class AudioCapture:
         self.label = label
         self.noise_reduction = noise_reduction
         self.level_callback = level_callback
+        self.write_file = write_file
+        self.sink = sink
+        self.callback_mode = callback_mode
         self.sample_rate = device.sample_rate
         self.channels = device.channels
         self.started_monotonic: float | None = None
@@ -289,7 +295,7 @@ class AudioCapture:
             self.sample_rate = int(round(float(info.get("defaultSampleRate") or self.device.sample_rate)))
             max_channels = int(info.get("maxInputChannels") or self.device.channels)
             self.channels = max(1, min(2, max_channels))
-            self._stream = self._pa.open(
+            stream_kwargs = dict(
                 format=pyaudio.paInt16,
                 channels=self.channels,
                 rate=self.sample_rate,
@@ -297,24 +303,52 @@ class AudioCapture:
                 input_device_index=self.device.index,
                 frames_per_buffer=1024,
             )
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self._wave = wave.open(str(self.path), "wb")
-            self._wave.setnchannels(self.channels)
-            self._wave.setsampwidth(2)
-            self._wave.setframerate(self.sample_rate)
+            if self.callback_mode:
+                stream_kwargs.update(stream_callback=self._callback, start=False)
+            self._stream = self._pa.open(**stream_kwargs)
+            if self.write_file:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self._wave = wave.open(str(self.path), "wb")
+                self._wave.setnchannels(self.channels)
+                self._wave.setsampwidth(2)
+                self._wave.setframerate(self.sample_rate)
         except Exception as exc:
             self.close()
             raise AudioError(f"{self.label}打开失败: {exc}") from exc
 
     def start(self) -> None:
-        if self._stream is None or self._wave is None:
+        if self._stream is None or (self.write_file and self._wave is None):
             raise AudioError(f"{self.label}尚未初始化")
-        self._thread = threading.Thread(target=self._run, name=f"audio-{self.label}", daemon=True)
         self.started_monotonic = time.monotonic()
+        if self.callback_mode:
+            self._ready.set()
+            self._stream.start_stream()
+            return
+        self._thread = threading.Thread(target=self._run, name=f"audio-{self.label}", daemon=True)
         self._thread.start()
 
+    def _callback(self, in_data, frame_count, time_info, status):
+        if self._stop.is_set():
+            return (None, pyaudio.paComplete)
+        if in_data:
+            if self.sink is not None:
+                try:
+                    self.sink(in_data)
+                except Exception as exc:
+                    if not self._stop.is_set():
+                        self.error = str(exc)
+                        _LOG.warning("%s sink failed: %s", self.label, exc)
+                    return (None, pyaudio.paComplete)
+            elif self._wave is not None:
+                self._wave.writeframes(in_data)
+            frames = len(in_data) // (2 * self.channels)
+            with self._lock:
+                self.frames_written += frames
+            self._update_level(in_data)
+        return (None, pyaudio.paContinue)
+
     def _run(self) -> None:
-        assert self._stream is not None and self._wave is not None
+        assert self._stream is not None
         self._ready.set()
         try:
             while not self._stop.is_set():
@@ -327,7 +361,16 @@ class AudioCapture:
                     break
                 if not data:
                     continue
-                self._wave.writeframes(data)
+                if self.sink is not None:
+                    try:
+                        self.sink(data)
+                    except Exception as exc:
+                        if not self._stop.is_set():
+                            self.error = str(exc)
+                            _LOG.warning("%s sink failed: %s", self.label, exc)
+                        break
+                elif self._wave is not None:
+                    self._wave.writeframes(data)
                 frames = len(data) // (2 * self.channels)
                 with self._lock:
                     self.frames_written += frames
@@ -335,7 +378,8 @@ class AudioCapture:
         finally:
             self._ready.set()
             try:
-                self._wave.close()
+                if self._wave is not None:
+                    self._wave.close()
             except Exception:
                 pass
             try:
@@ -377,6 +421,31 @@ class AudioCapture:
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
+        if self.callback_mode:
+            stream = self._stream
+            if stream is not None:
+                try:
+                    stream.stop_stream()
+                except Exception:
+                    pass
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+                self._stream = None
+            try:
+                if self._wave is not None:
+                    self._wave.close()
+            except Exception:
+                pass
+            if self._pa is not None:
+                try:
+                    self._pa.terminate()
+                except Exception:
+                    pass
+                self._pa = None
+            self._closed.set()
+            return
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             if self._thread.is_alive():
@@ -401,6 +470,35 @@ class AudioCapture:
                     self._stream.close()
             except Exception:
                 pass
+
+    def abort(self) -> None:
+        """Force a blocked read to return without waiting for the stream."""
+        self._stop.set()
+        stream = self._stream
+        if stream is not None:
+            try:
+                stream.stop_stream()
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=0.5)
+        try:
+            if self._wave is not None:
+                self._wave.close()
+        except Exception:
+            pass
+        if self._pa is not None:
+            try:
+                self._pa.terminate()
+            except Exception:
+                pass
+            self._pa = None
+        self._stream = None
+        self._closed.set()
 
     def close(self) -> None:
         if self._wave is not None:

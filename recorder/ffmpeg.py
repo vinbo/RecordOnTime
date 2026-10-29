@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -122,6 +123,13 @@ def select_video_encoder(ffmpeg: Path) -> str:
     cached = _VIDEO_ENCODER_CACHE.get(key)
     if cached is not None:
         return cached
+    if os.environ.get("SCREEN_RECORDER_SOFTWARE_ENCODER"):
+        _VIDEO_ENCODER_CACHE[key] = "libx264"
+        return "libx264"
+    forced = os.environ.get("SCREEN_RECORDER_VIDEO_ENCODER")
+    if forced in ("h264_qsv", "h264_mf", "libx264"):
+        _VIDEO_ENCODER_CACHE[key] = forced
+        return forced
     encoder = "libx264"
     try:
         result = subprocess.run(
@@ -143,6 +151,10 @@ def select_video_encoder(ffmpeg: Path) -> str:
                 "-global_quality",
                 "20",
                 "-look_ahead",
+                "0",
+                "-async_depth",
+                "1",
+                "-bf",
                 "0",
                 "-preset",
                 "veryfast",
@@ -179,7 +191,7 @@ def build_video_command(
     height = max(2, monitor.height - (monitor.height % 2))
     encoder = encoder or select_video_encoder(ffmpeg)
     use_ddagrab = (
-        encoder == "h264_qsv"
+        encoder in ("h264_qsv", "h264_mf")
         and source != "gdigrab"
         and monitor.index >= 0
         and abs(width / max(1, height) - config.width / max(1, config.height)) < 0.01
@@ -201,7 +213,13 @@ def build_video_command(
                 f"ddagrab={monitor.index}:framerate={config.fps}:"
                 f"draw_mouse={1 if config.capture_cursor else 0}",
                 "-vf",
-                f"hwmap=derive_device=qsv,scale_qsv=w={config.width}:h={config.height}:mode=hq",
+                (
+                    f"hwmap=derive_device=qsv,scale_qsv=w={config.width}:h={config.height}:mode=hq"
+                    if encoder == "h264_qsv"
+                    else "hwmap=derive_device=qsv,"
+                    f"scale_qsv=w={config.width}:h={config.height}:mode=hq,"
+                    "hwdownload,format=bgra,format=yuv420p"
+                ),
             ]
         )
     else:
@@ -239,10 +257,16 @@ def build_video_command(
                 "20",
                 "-look_ahead",
                 "0",
+                "-async_depth",
+                "1",
+                "-bf",
+                "0",
                 "-preset",
                 "veryfast",
             ]
         )
+    elif encoder == "h264_mf":
+        command.extend(["-c:v", "h264_mf", "-b:v", "3M", "-bf", "0"])
     else:
         command.extend(
             [
@@ -279,7 +303,310 @@ def build_video_command(
             str(output),
         ]
     )
+    if encoder == "h264_mf":
+        for option in ("-profile:v", "-level", "-sc_threshold"):
+            if option in command:
+                index = command.index(option)
+                del command[index : index + 2]
     return command
+
+
+def build_direct_command(
+    ffmpeg: Path,
+    config: RecordingConfig,
+    output: Path,
+    *,
+    audio_rate: int,
+    audio_channels: int,
+    noise_reduction: bool,
+    encoder: str | None = None,
+    source: str | None = None,
+) -> list[str]:
+    """One-process MP4 recording: video and a live PCM pipe, no post muxing."""
+    audio_filters = [
+        "aresample=48000",
+        "aformat=sample_fmts=fltp:channel_layouts=stereo",
+    ]
+    if os.environ.get("SCREEN_RECORDER_DIRECT_RAW_AUDIO"):
+        audio_filters = ["anull"]
+    else:
+        if noise_reduction:
+            audio_filters.append("afftdn=nr=8:nf=-32")
+        audio_filters.extend(
+            [
+                "highpass=f=70",
+                "dynaudnorm=f=250:g=15:p=0.9",
+                "alimiter=limit=0.95",
+            ]
+        )
+    aac = select_aac_encoder(ffmpeg)
+    command = build_video_command(
+        ffmpeg, config, output, encoder=encoder, source=source
+    )
+    # build_video_command puts -vf and the encoder options after the video
+    # input.  Split there so the PCM input can be inserted before those output
+    # options; otherwise -vf would be parsed as an option for pipe:0.
+    filter_index = command.index("-vf")
+    input_part = command[:filter_index]
+    output_part = command[filter_index:-3]  # drop -f matroska + output path
+    if "-an" in input_part:
+        input_part.remove("-an")
+    command = input_part + [
+        "-f",
+        "s16le",
+        "-ar",
+        str(audio_rate),
+        "-ac",
+        str(audio_channels),
+        "-i",
+        "pipe:0",
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+    ]
+    command.extend(output_part)
+    command.extend(
+        [
+            "-af",
+            ",".join(audio_filters),
+            "-c:a",
+            aac,
+            "-b:a",
+            "192k",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+        ]
+    )
+    if aac == "aac":
+        command.extend(["-aac_coder", "fast"])
+    command.extend(["-shortest", "-f", "mp4", str(output)])
+    return command
+
+
+class DirectRecorder:
+    """Records video and live PCM audio directly into the final MP4.
+
+    Closing the PCM pipe makes FFmpeg finalise the MP4 immediately; there is
+    no post-recording video copy or audio encode.  Only one audio source is
+    supported on this path.
+    """
+
+    def __init__(
+        self,
+        config: RecordingConfig,
+        output: Path,
+        capture,
+        *,
+        ffmpeg: Path | None = None,
+        encoder: str | None = None,
+        source: str | None = None,
+    ) -> None:
+        self.config = config
+        self.output = Path(output)
+        self.capture = capture
+        self.ffmpeg = ffmpeg or find_ffmpeg()
+        base_encoder = encoder or select_video_encoder(self.ffmpeg)
+        # QSV plus a live PCM input hits a QSV/filter memory allocation bug on
+        # some drivers.  Use MF's H.264 encoder for the direct path; normal MKV
+        # recording keeps using QSV.
+        if base_encoder == "h264_qsv" and not os.environ.get("SCREEN_RECORDER_DIRECT_QSV"):
+            base_encoder = "h264_mf"
+        self.encoder = base_encoder
+        if os.environ.get("SCREEN_RECORDER_DIRECT_GDI"):
+            self.source = "gdigrab"
+        else:
+            self.source = source or (
+                "ddagrab" if self.encoder == "h264_qsv" and _can_ddagrab(config) else "gdigrab"
+            )
+        self.process: subprocess.Popen | None = None
+        self.command: list[str] = []
+        self.started_monotonic: float | None = None
+        self.started_at = None
+        self._stderr: deque[str] = deque(maxlen=120)
+        self._reader: threading.Thread | None = None
+        self._writer: threading.Thread | None = None
+        self._stderr_lock = threading.Lock()
+        self._queue: queue.Queue[bytes] = queue.Queue(maxsize=2000)
+        self._stop = threading.Event()
+        self.capture.write_file = False
+        self.capture.sink = self._enqueue
+
+    def _enqueue(self, data: bytes) -> None:
+        try:
+            self._queue.put_nowait(data)
+        except queue.Full:
+            _LOG.warning("Audio pipe queue full; dropping a frame")
+
+    def start(self) -> None:
+        self.output.parent.mkdir(parents=True, exist_ok=True)
+        self.command = build_direct_command(
+            self.ffmpeg,
+            self.config,
+            self.output,
+            audio_rate=self.capture.sample_rate,
+            audio_channels=self.capture.channels,
+            noise_reduction=self.capture.noise_reduction,
+            encoder=self.encoder,
+            source=self.source,
+        )
+        _LOG.info("Starting direct MP4 capture: %s", subprocess.list2cmdline(self.command))
+        self.process = subprocess.Popen(
+            self.command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+            creationflags=_CREATE_NO_WINDOW,
+            startupinfo=_startupinfo(),
+        )
+        self.started_monotonic = time.monotonic()
+        self.started_at = time.time()
+        self._reader = threading.Thread(target=self._read_stderr, name="direct-stderr", daemon=True)
+        self._reader.start()
+        self.capture.start()
+        self._writer = threading.Thread(target=self._write_audio, name="direct-audio", daemon=True)
+        self._writer.start()
+        time.sleep(0.7)
+        code = self.process.poll()
+        if code is not None:
+            self._reader.join(timeout=1.0)
+            detail = self.error_text()
+            raise FFmpegError(f"直接录制启动失败（FFmpeg 退出码 {code}）。{detail}")
+
+    def _read_stderr(self) -> None:
+        stream = self.process.stderr if self.process else None
+        if stream is None:
+            return
+        try:
+            for raw in iter(stream.readline, b""):
+                line = raw.decode("utf-8", "replace").rstrip()
+                if line:
+                    with self._stderr_lock:
+                        self._stderr.append(line)
+        except Exception:
+            pass
+
+    def _write_audio(self) -> None:
+        assert self.process is not None and self.process.stdin is not None
+        rate = max(1, self.capture.sample_rate)
+        channels = max(1, self.capture.channels)
+        frame_bytes = 2 * channels
+        while self.capture.started_monotonic is None and not self._stop.is_set():
+            time.sleep(0.02)
+        audio_start = self.capture.started_monotonic or time.monotonic()
+        video_start = self.started_monotonic or audio_start
+        offset = audio_start - video_start
+        _LOG.info(
+            "Direct audio timeline: video=%s audio=%s offset=%.3fs rate=%s ch=%s",
+            video_start,
+            audio_start,
+            offset,
+            rate,
+            channels,
+        )
+        try:
+            base_bytes = max(0, int(offset * rate)) * frame_bytes
+            if offset < 0:
+                drop = int(-offset * rate) * frame_bytes
+                while drop > 0:
+                    chunk = self._queue.get(timeout=1.0)
+                    if len(chunk) <= drop:
+                        drop -= len(chunk)
+                    else:
+                        self.process.stdin.write(chunk[drop:])
+                        drop = 0
+            if base_bytes:
+                silence = b"\x00" * base_bytes
+                for start in range(0, len(silence), 65536):
+                    self.process.stdin.write(silence[start : start + 65536])
+            written = base_bytes
+            wall_start = time.monotonic()
+            bytes_per_second = rate * frame_bytes
+            while not self._stop.is_set():
+                try:
+                    data = self._queue.get_nowait()
+                except queue.Empty:
+                    # Idle WASAPI loopback can stop producing packets.  Feed
+                    # real-time silence so -shortest does not end the video.
+                    target = int((time.monotonic() - wall_start) * bytes_per_second) + base_bytes
+                    if target > written:
+                        pad = min(target - written, bytes_per_second // 20)
+                        self.process.stdin.write(b"\x00" * pad)
+                        written += pad
+                    time.sleep(0.01)
+                else:
+                    self.process.stdin.write(data)
+                    written += len(data)
+        except (BrokenPipeError, OSError, ValueError) as exc:
+            if not self._stop.is_set():
+                _LOG.warning("Direct audio writer stopped: %s", exc)
+        except Exception:
+            _LOG.exception("Unexpected direct audio writer failure")
+        finally:
+            try:
+                self.process.stdin.close()
+            except Exception:
+                pass
+
+    def error_text(self) -> str:
+        with self._stderr_lock:
+            lines = [line for line in self._stderr if line.strip()]
+        return "\n".join(lines[-8:])
+
+    def is_alive(self) -> bool:
+        return self.process is not None and self.process.poll() is None
+
+    def stop(self, timeout: float = 10.0) -> None:
+        # Stop the audio feed immediately; MP4 finalisation happens while the
+        # blocked PyAudio read is being aborted, so the user does not wait for
+        # the capture thread first.
+        self._stop.set()
+        process = self.process
+        if process is not None:
+            try:
+                if process.stdin is not None:
+                    process.stdin.close()
+            except Exception:
+                pass
+            try:
+                process.wait(timeout=min(timeout, 4.0))
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except Exception:
+                    process.kill()
+        if self._writer is not None:
+            self._writer.join(timeout=1.0)
+        try:
+            self.capture.abort()
+        except Exception:
+            pass
+        if self._reader is not None:
+            self._reader.join(timeout=1.0)
+        if self.process is not None:
+            _LOG.info(
+                "Direct recorder finished rc=%s stderr=%s",
+                self.process.returncode,
+                self.error_text(),
+            )
+        if not self.output.exists() or self.output.stat().st_size < 1024:
+            _LOG.warning("Direct recorder produced no media: %s", self.error_text())
+
+
+def _can_ddagrab(config: RecordingConfig) -> bool:
+    monitor = config.monitor
+    return (
+        monitor.index >= 0
+        and abs(
+            monitor.width / max(1, monitor.height)
+            - config.width / max(1, config.height)
+        )
+        < 0.01
+    )
 
 
 class VideoRecorder:

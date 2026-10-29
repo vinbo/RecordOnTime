@@ -63,7 +63,7 @@ Copy-Item (Join-Path $root "LICENSE") $distDir -Force
 Copy-Item (Join-Path $root "screenshots") $distDir -Recurse -Force
 
 Write-Host "[5/5] 正在生成 ZIP..." -ForegroundColor Cyan
-$zip = Join-Path $root "dist\RecordOnTime_v1.1.6_win64.zip"
+$zip = Join-Path $root "dist\RecordOnTime_v1.1.7_win64.zip"
 if (Test-Path $zip) { Remove-Item -LiteralPath $zip -Force }
 Compress-Archive -Path (Join-Path $distDir "*") -DestinationPath $zip -CompressionLevel Optimal
 

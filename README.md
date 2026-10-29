@@ -6,7 +6,7 @@ A 720P Windows screen recorder with **scheduled start**, **scheduled stop**, **p
 
 中文界面：[screenshots/ui_zh.png](screenshots/ui_zh.png)
 
-**Download:** [RecordOnTime_v1.1.6_win64.zip](dist/RecordOnTime_v1.1.6_win64.zip) (local build)
+**Download:** [RecordOnTime_v1.1.7_win64.zip](dist/RecordOnTime_v1.1.7_win64.zip) (local build)
 
 ## Highlights
 
@@ -21,7 +21,7 @@ A 720P Windows screen recorder with **scheduled start**, **scheduled stop**, **p
 
 ## Quick start
 
-1. Download [RecordOnTime_v1.1.6_win64.zip](dist/RecordOnTime_v1.1.6_win64.zip) and extract the whole folder.
+1. Download [RecordOnTime_v1.1.7_win64.zip](dist/RecordOnTime_v1.1.7_win64.zip) and extract the whole folder.
 2. Run `RecordOnTime.exe`.
 3. Choose a display, audio source and output folder.
 4. Pick **Now** or **Scheduled**, set **Duration / End time / Manual**, then click the red button.
@@ -43,6 +43,15 @@ No Python, FFmpeg or PyAudio installation is required in the packaged build.
 - Keep the app running. It can be minimized; it must not be closed. While waiting/recording, RecordOnTime asks Windows to stay awake and keep the display on (can be disabled in the Screen card).
 
 Actual capture usually begins 0.2–2 seconds after the trigger because audio devices and FFmpeg must start; the stop time remains the configured absolute time.
+
+### Change the end mode while recording
+
+Click **End mode…** in the status card during recording or pause:
+
+- choose **Use manual end** to remove the automatic stop;
+- or enter a date/time and choose **Set automatic end** to add/replace the stop time.
+
+The watchdog reads the new value immediately; no restart is needed. If the new time is already due, recording stops immediately.
 
 ### Pause / resume
 
@@ -83,43 +92,32 @@ Recordings go to the selected folder (default `%USERPROFILE%\Videos\RecordOnTime
 
 ### Recording CPU
 
-The old encoder was libx264 `veryfast` (CRF 19) and could exceed 20% CPU. v1.1.6 uses a GPU path on supported 16:9 monitors:
+The old encoder was libx264 `veryfast` (CRF 19) and could exceed 20–25% CPU. v1.1.7 records single-audio-source sessions directly to MP4 with **Media Foundation H.264 (`h264_mf`) + gdigrab**:
 
-- **Desktop Duplication (`ddagrab`) + Intel Quick Sync** keeps frames on the GPU, with hardware scaling to 1280×720;
-- measured recording CPU on this machine: about **1–2%**, versus about 20% for the old x264 path;
-- output is still 1280×720 H.264 at 30 FPS;
-- if Desktop Duplication/QSV is unavailable, it falls back to `gdigrab` + QSV (roughly 7–10%), then to x264 `ultrafast` (still much lighter than `veryfast`);
-- non-16:9 monitors use the gdigrab/QSV fallback because the hardware scaler path does not letterbox.
-
-The software scaler for the fallback path uses bicubic instead of the more expensive Lanczos filter.
+- measured recording CPU on this machine: about **9%**, down from 20–25%;
+- output is 1280×720 H.264 at 30 FPS;
+- no audio or system+microphone recordings still use the MKV path with Desktop Duplication/QSV (about 1–2%), but need post-processing;
+- Desktop Duplication cannot be combined with the live PCM input used by the direct-MP4 path on this driver (QSV surface allocation failure), so it is not used there.
 
 ### Saving speed
 
-Four things used to dominate stop time:
+The direct-MP4 path needs **no post-recording mux**: FFmpeg writes the final MP4 while recording, so stopping only finalises the MP4 index and renames the file. Measured **0.4–0.6 seconds** after stop, including probing and cleanup. This applies to uninterrupted single-audio recordings, including 2-hour files.
 
-1. the native FFmpeg AAC encoder — about **50 seconds** for 30 minutes of real (non-silent) audio, even though it was fast on silence;
-2. audio for a 2-hour recording still took ~56 seconds even with `aac_mf` in one pass;
-3. copying the finished MP4 across drives;
-4. the `+faststart` rewrite of the whole MP4.
-
-v1.1.6 addresses them:
+For the fallback MKV path (system + microphone, or direct capture unavailable), v1.1.7 still uses parallel AAC chunks:
 
 - audio uses **Windows Media Foundation AAC (`aac_mf`)** (native AAC with `-aac_coder fast` as fallback);
-- for single-track recordings of **1 hour or longer**, the audio timeline is split into up to four chunks encoded **in parallel**, then concatenated with `-c:a copy`;
-- capture files stay in `<output folder>\.RecordOnTime_tmp\` on the same volume, and single-segment video is muxed directly to the final MP4;
-- no `faststart` rewrite.
+- for single-track recordings of **1 hour or longer**, up to four audio chunks are encoded in parallel and concatenated with `-c:a copy`;
+- a 2-hour synthetic non-silent test completed in about 40 seconds.
 
-A 2-hour, non-silent synthetic recording (1.38 GB WAV audio) completed finalisation in about **40 seconds** on this machine, including video copy, chunk concatenation and muxing. A real 1 GB video adds normal disk read/write time, but the previous 56-second single-pass AAC cost is removed.
-
-The parallel-audio fast path applies to a single audio track (the normal system-audio case). System + microphone recordings use the existing single-pass mix and still take longer to save.
+Pause/resume uses multiple segments. Paused recordings still need a final concat and may exceed 2 seconds; uninterrupted recordings use the direct path.
 
 ## How it works
 
 - Python 3.11 + Tkinter UI.
-- FFmpeg `ddagrab` (Desktop Duplication) with QSV hardware scaling/encoding; `gdigrab` + QSV or x264 ultrafast fallback, 720P.
-- PyAudioWPatch / PortAudio WASAPI loopback for system sound, plus optional microphone. Each source is written to a WAV with monotonic start offsets.
-- Pause/resume creates numbered MKV/WAV segments. At stop time each segment is muxed to MP4 with identical streams and concatenated with FFmpeg’s concat demuxer (`-c copy`).
-- An independent watchdog thread enforces `stop_at`, so auto-stop works even if the UI is briefly busy.
+- Single-audio recordings use `h264_mf` + gdigrab and write MP4 directly; no-audio / system+mic recordings use `ddagrab`+QSV MKV with `gdigrab`/x264 fallbacks, 720P.
+- PyAudioWPatch / PortAudio WASAPI loopback for system sound, plus optional microphone. A callback stream feeds live 48 kHz PCM to the direct MP4 encoder; the MKV path writes WAV segments.
+- Pause/resume creates numbered segments. Direct-MP4 segments are concatenated only if pause was used; uninterrupted recordings are finalized in place.
+- An independent watchdog thread enforces `stop_at`, so auto-stop works even if the UI is briefly busy. The end mode can be changed live between automatic and manual.
 - `SetThreadExecutionState` prevents sleep; a named mutex enforces a single instance.
 
 ## Files and settings
@@ -148,7 +146,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 Output:
 
 - `dist\RecordOnTime\RecordOnTime.exe`
-- `dist\RecordOnTime_v1.1.6_win64.zip`
+- `dist\RecordOnTime_v1.1.7_win64.zip`
 
 The PyInstaller spec is `RecordOnTime.spec`; FFmpeg is bundled as `vendor\ffmpeg.exe` (not embedded into the EXE) for fast startup. The binary is not committed to Git; `build.ps1` fetches it via `imageio-ffmpeg`, and the release ZIP includes it.
 

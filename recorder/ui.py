@@ -777,6 +777,21 @@ class RecorderApp(tk.Tk):
             pady=7,
             cursor="hand2",
         )
+        self.change_end_btn = tk.Button(
+            body,
+            text="结束方式…",
+            command=self._on_change_end,
+            bg=CARD2,
+            fg=TEXT,
+            activebackground=CARD3,
+            activeforeground=TEXT,
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            font=FONT_SMALL,
+            pady=7,
+            cursor="hand2",
+        )
         self.progress = ttk.Progressbar(
             body, style="Accent.Horizontal.TProgressbar", mode="indeterminate", length=200
         )
@@ -1692,6 +1707,9 @@ class RecorderApp(tk.Tk):
         if state in (STATE_RECORDING, STATE_PAUSED):
             if not self.pause_btn.winfo_manager():
                 self.pause_btn.pack(fill="x", pady=(3, 2), before=self.warning_label)
+            if not self.change_end_btn.winfo_manager():
+                self.change_end_btn.pack(fill="x", pady=(3, 2), before=self.warning_label)
+            self.change_end_btn.configure(text=self.t("结束方式…"), state="normal")
             if state == STATE_RECORDING:
                 self.pause_btn.configure(
                     text=self.t("暂停"), state="normal", bg=CARD2, fg=TEXT
@@ -1703,6 +1721,9 @@ class RecorderApp(tk.Tk):
         elif state in (STATE_PAUSING, STATE_RESUMING):
             if not self.pause_btn.winfo_manager():
                 self.pause_btn.pack(fill="x", pady=(3, 2), before=self.warning_label)
+            if not self.change_end_btn.winfo_manager():
+                self.change_end_btn.pack(fill="x", pady=(3, 2), before=self.warning_label)
+            self.change_end_btn.configure(state="disabled")
             self.pause_btn.configure(
                 text=self.t("暂停中…") if state == STATE_PAUSING else self.t("继续中…"),
                 state="disabled",
@@ -1712,7 +1733,97 @@ class RecorderApp(tk.Tk):
         else:
             if self.pause_btn.winfo_manager():
                 self.pause_btn.pack_forget()
+            if self.change_end_btn.winfo_manager():
+                self.change_end_btn.pack_forget()
             self.pause_btn.configure(text=self.t("暂停"))
+
+    def _on_change_end(self) -> None:
+        state = self._engine.state
+        if state not in (STATE_RECORDING, STATE_PAUSED):
+            return
+        dialog = tk.Toplevel(self)
+        dialog.title(self.t("结束方式"))
+        dialog.configure(bg=BG)
+        dialog.transient(self)
+        dialog.resizable(False, False)
+        body = tk.Frame(dialog, bg=BG)
+        body.pack(fill="both", expand=True, padx=20, pady=18)
+        tk.Label(
+            body,
+            text=self.t("结束方式"),
+            bg=BG,
+            fg=TEXT,
+            font=("Microsoft YaHei UI", 13, "bold"),
+        ).pack(anchor="w")
+        current = self._active_stop_at
+        tk.Label(
+            body,
+            text=(
+                self.t("当前：自动结束 {time}", time=current.strftime("%Y-%m-%d %H:%M:%S"))
+                if current
+                else self.t("当前：手动结束")
+            ),
+            bg=BG,
+            fg=MUTED,
+            font=FONT_SMALL,
+        ).pack(anchor="w", pady=(5, 12))
+        target = current or (datetime.now() + timedelta(minutes=30))
+        end_date = tk.StringVar(value=target.strftime("%Y-%m-%d"))
+        end_time = tk.StringVar(value=target.strftime("%H:%M:%S"))
+        self._dialog_date_row(body, "自动结束时间", end_date, end_time)
+        error_label = tk.Label(body, text="", bg=BG, fg=ACCENT, font=FONT_TINY)
+        error_label.pack(anchor="w", pady=(6, 0))
+        buttons = tk.Frame(body, bg=BG)
+        buttons.pack(fill="x", pady=(12, 0))
+
+        def apply(stop_at: datetime | None) -> None:
+            if stop_at is not None and stop_at <= datetime.now() + timedelta(seconds=2):
+                error_label.configure(text=self.t("结束时间需要晚于当前时间。"))
+                return
+            self._active_stop_at = stop_at
+            self._updating = True
+            try:
+                if stop_at is None:
+                    self.end_segment.set(END_NONE)
+                else:
+                    self.end_segment.set(END_AT)
+                    self.end_date_var.set(stop_at.strftime("%Y-%m-%d"))
+                    self.end_time_var.set(stop_at.strftime("%H:%M:%S"))
+            finally:
+                self._updating = False
+            self._engine.set_stop_at(stop_at)
+            self._update_mode_rows()
+            self._update_preview()
+            self._set_footer(
+                "已改为手动结束。" if stop_at is None else "已改为 {time} 自动结束。",
+                GREEN,
+                time=stop_at.strftime("%H:%M:%S") if stop_at else "",
+            )
+            dialog.destroy()
+
+        def manual() -> None:
+            apply(None)
+
+        def scheduled() -> None:
+            try:
+                stop_at = parse_datetime(end_date.get(), end_time.get())
+            except ValueError as exc:
+                error_label.configure(text=self.t(str(exc)))
+                return
+            apply(stop_at)
+
+        self._dialog_button(buttons, "改为手动结束", manual, accent=False).pack(side="left")
+        self._dialog_button(buttons, "设为自动结束", scheduled, accent=True).pack(
+            side="left", padx=(6, 0)
+        )
+        self._dialog_button(buttons, "取消", dialog.destroy).pack(side="left", padx=(6, 0))
+        dialog.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dialog.winfo_width()) // 2
+        y = self.winfo_rooty() + 100
+        dialog.geometry(f"+{max(0, x)}+{max(0, y)}")
+        dialog.attributes("-alpha", 1.0)
+        dialog.grab_set()
+        dialog.focus_force()
 
     # ------------------------------------------------------------------- state
     def _apply_engine_state(self, state: str) -> None:
@@ -2041,6 +2152,21 @@ class RecorderApp(tk.Tk):
             self._update_pause_button()
             self._progress_stop()
             self._set_footer("录制中 · 按 F9 停止，F10 暂停", ACCENT)
+        elif kind == "stop_at_changed":
+            stop_at = event.get("stop_at")
+            self._active_stop_at = datetime.fromisoformat(stop_at) if stop_at else None
+            self._updating = True
+            try:
+                if self._active_stop_at is None:
+                    self.end_segment.set(END_NONE)
+                else:
+                    self.end_segment.set(END_AT)
+                    self.end_date_var.set(self._active_stop_at.strftime("%Y-%m-%d"))
+                    self.end_time_var.set(self._active_stop_at.strftime("%H:%M:%S"))
+            finally:
+                self._updating = False
+            self._update_mode_rows()
+            self._update_preview()
         elif kind == "warning":
             self._append_warning(event.get("message", ""))
         elif kind == "auto_stopping":
