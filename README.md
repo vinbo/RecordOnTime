@@ -6,7 +6,7 @@ A 720P Windows screen recorder with **scheduled start**, **scheduled stop**, **p
 
 中文界面：[screenshots/ui_zh.png](screenshots/ui_zh.png)
 
-**Download:** [RecordOnTime_v1.1.9_win64.zip](dist/RecordOnTime_v1.1.9_win64.zip) (local build)
+**Download:** [RecordOnTime_v1.1.10_win64.zip](dist/RecordOnTime_v1.1.10_win64.zip) (local build)
 
 ## Highlights
 
@@ -21,7 +21,7 @@ A 720P Windows screen recorder with **scheduled start**, **scheduled stop**, **p
 
 ## Quick start
 
-1. Download [RecordOnTime_v1.1.9_win64.zip](dist/RecordOnTime_v1.1.9_win64.zip) and extract the whole folder.
+1. Download [RecordOnTime_v1.1.10_win64.zip](dist/RecordOnTime_v1.1.10_win64.zip) and extract the whole folder.
 2. Run `RecordOnTime.exe`.
 3. Choose a display, audio source and output folder.
 4. Pick **Now** or **Scheduled**, set **Duration / End time / Manual**, then click the red button.
@@ -92,7 +92,7 @@ Recordings go to the selected folder (default `%USERPROFILE%\Videos\RecordOnTime
 
 ### Recording CPU
 
-The old encoder was libx264 `veryfast` (CRF 19) and could exceed 20–25% CPU. v1.1.9 records single-audio-source sessions directly to MP4 with **x264 ultrafast (CRF 23) + gdigrab**:
+The old encoder was libx264 `veryfast` (CRF 19) and could exceed 20–25% CPU. v1.1.10 records single-audio-source sessions directly to MP4 with **x264 ultrafast (CRF 23) + gdigrab**:
 
 - measured recording CPU on this machine: about **2%**, down from 20–25%;
 - output is 1280×720 H.264 at 30 FPS, with a similar file size (about 1 GB for two hours of lecture content);
@@ -101,9 +101,9 @@ The old encoder was libx264 `veryfast` (CRF 19) and could exceed 20–25% CPU. v
 
 ### Saving speed
 
-The direct-MP4 path needs **no post-recording mux**: FFmpeg writes the final fragmented MP4 while recording, so stopping only closes the current fragment and renames the file. Measured **0.7–1.2 seconds** after stop, including probing and cleanup. This applies to uninterrupted single-audio recordings, including 2-hour files.
+The direct-MP4 path needs **no post-recording mux**: FFmpeg writes the final MP4 while recording, so stopping only finalises the MP4 index and renames the file. Measured **0.7–1.2 seconds** after stop, including probing and cleanup. This applies to uninterrupted single-audio recordings, including 2-hour files.
 
-For the fallback MKV path (system + microphone, or direct capture unavailable), v1.1.9 still uses parallel AAC chunks:
+For the fallback MKV path (system + microphone, or direct capture unavailable), v1.1.10 still uses parallel AAC chunks:
 
 - audio uses **Windows Media Foundation AAC (`aac_mf`)** (native AAC with `-aac_coder fast` as fallback);
 - for single-track recordings of **1 hour or longer**, up to four audio chunks are encoded in parallel and concatenated with `-c:a copy`;
@@ -111,7 +111,7 @@ For the fallback MKV path (system + microphone, or direct capture unavailable), 
 
 Pause/resume uses multiple segments. Paused recordings still need a final concat and may exceed 2 seconds; uninterrupted recordings use the direct path.
 
-Fragmented MP4 initially leaves `mvhd`/`tkhd`/`mdhd` durations at zero, which makes the Windows Explorer **Length** column blank even though players can read the fragments. v1.1.9 patches those small duration fields in place after recording, without rewriting the media data, so Explorer shows the correct duration.
+The direct output is a standard (non-fragmented) MP4. Fragmented MP4 played poorly in some Windows players, showing a still image at fragment boundaries; standard MP4 also carries the `mvhd` duration that Windows Explorer displays in the **Length** column.
 
 ## How it works
 
@@ -148,7 +148,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 Output:
 
 - `dist\RecordOnTime\RecordOnTime.exe`
-- `dist\RecordOnTime_v1.1.9_win64.zip`
+- `dist\RecordOnTime_v1.1.10_win64.zip`
 
 The PyInstaller spec is `RecordOnTime.spec`; FFmpeg is bundled as `vendor\ffmpeg.exe` (not embedded into the EXE) for fast startup. The binary is not committed to Git; `build.ps1` fetches it via `imageio-ffmpeg`, and the release ZIP includes it.
 

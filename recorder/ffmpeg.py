@@ -385,9 +385,7 @@ def build_direct_command(
     )
     if aac == "aac":
         command.extend(["-aac_coder", "fast"])
-    command.extend(
-        ["-movflags", "+frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", str(output)]
-    )
+    command.extend(["-f", "mp4", str(output)])
     return command
 
 

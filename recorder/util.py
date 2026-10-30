@@ -14,7 +14,7 @@ from pathlib import Path
 APP_NAME = "RecordOnTime"
 APP_NAME_EN = "RecordOnTime"
 APP_ID = "RecordOnTime"
-APP_VERSION = "1.1.9"
+APP_VERSION = "1.1.10"
 
 _LOG = logging.getLogger(__name__)
 
