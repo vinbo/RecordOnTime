@@ -6,7 +6,7 @@ A 720P Windows screen recorder with **scheduled start**, **scheduled stop**, **p
 
 中文界面：[screenshots/ui_zh.png](screenshots/ui_zh.png)
 
-**Download:** [RecordOnTime_v1.1.10_win64.zip](dist/RecordOnTime_v1.1.10_win64.zip) (local build)
+**Download:** [RecordOnTime_v1.2.0_win64.zip](dist/RecordOnTime_v1.2.0_win64.zip) (local build)
 
 ## Highlights
 
@@ -21,7 +21,7 @@ A 720P Windows screen recorder with **scheduled start**, **scheduled stop**, **p
 
 ## Quick start
 
-1. Download [RecordOnTime_v1.1.10_win64.zip](dist/RecordOnTime_v1.1.10_win64.zip) and extract the whole folder.
+1. Download [RecordOnTime_v1.2.0_win64.zip](dist/RecordOnTime_v1.2.0_win64.zip) and extract the whole folder.
 2. Run `RecordOnTime.exe`.
 3. Choose a display, audio source and output folder.
 4. Pick **Now** or **Scheduled**, set **Duration / End time / Manual**, then click the red button.
@@ -83,7 +83,7 @@ Top-right **Menu**:
 | Item | Value |
 |---|---|
 | Container | MP4 (standard, no faststart — finalizes much faster) |
-| Video | H.264 High Profile, 1280×720, 30 FPS; direct path x264 ultrafast, other paths Desktop Duplication + QSV |
+| Video | H.264 High Profile, 1280×720, 30 FPS; Desktop Duplication + QSV, audio encoded separately |
 | Audio | AAC-LC 48 kHz stereo 192 kbps (Windows Media Foundation encoder, native fallback) |
 | Aspect ratio | Preserved, letterboxed to exactly 1280×720 |
 | Temporary format | MKV segments while recording; MP4 when finished |
@@ -92,31 +92,36 @@ Recordings go to the selected folder (default `%USERPROFILE%\Videos\RecordOnTime
 
 ### Recording CPU
 
-The old encoder was libx264 `veryfast` (CRF 19) and could exceed 20–25% CPU. v1.1.10 records single-audio-source sessions directly to MP4 with **x264 ultrafast (CRF 23) + gdigrab**:
+The old encoder was libx264 `veryfast` (CRF 19) and could exceed 20–25% CPU. v1.2.0 records the screen with **Desktop Duplication (`ddagrab`) + Intel Quick Sync** and encodes audio in a separate AAC process:
 
-- measured recording CPU on this machine: about **2%**, down from 20–25%;
-- output is 1280×720 H.264 at 30 FPS, with a similar file size (about 1 GB for two hours of lecture content);
-- no audio or system+microphone recordings still use the MKV path with Desktop Duplication/QSV (about 1–2%), but need post-processing;
-- QSV cannot be combined with the live PCM input on this driver (it either throttles frames or fails surface allocation), so the direct path uses x264 ultrafast.
+- measured recording CPU on this machine: about **1.8%**, down from 20–25%;
+- output is 1280×720 H.264 at 30 FPS;
+- Desktop Duplication captures hardware-overlay/DirectX video that `gdigrab` sees as a frozen frame;
+- audio is encoded separately so the QSV video encoder never waits for live PCM (that combination drops frames on this driver).
 
 ### Saving speed
 
-The direct-MP4 path needs **no post-recording mux**: FFmpeg writes the final MP4 while recording, so stopping only finalises the MP4 index and renames the file. Measured **0.7–1.2 seconds** after stop, including probing and cleanup. This applies to uninterrupted single-audio recordings, including 2-hour files.
+Video and audio are recorded as separate files and muxed with stream copy when recording stops. No re-encoding happens, but the video bytes are copied once:
 
-For the fallback MKV path (system + microphone, or direct capture unavailable), v1.1.10 still uses parallel AAC chunks:
+- a 30-minute / 200 MB recording: about **1 second**;
+- a 2-hour / 1 GB recording: about **5 seconds** on this machine.
+
+This is slower than the previous direct-to-MP4 path for very long recordings, but it is the only tested configuration that stays smooth on hardware-overlay video while keeping CPU near 2%.
+
+For the fallback MKV path (system + microphone, or direct capture unavailable), v1.2.0 still uses parallel AAC chunks:
 
 - audio uses **Windows Media Foundation AAC (`aac_mf`)** (native AAC with `-aac_coder fast` as fallback);
 - for single-track recordings of **1 hour or longer**, up to four audio chunks are encoded in parallel and concatenated with `-c:a copy`;
 - a 2-hour synthetic non-silent test completed in about 40 seconds.
 
-Pause/resume uses multiple segments. Paused recordings still need a final concat and may exceed 2 seconds; uninterrupted recordings use the direct path.
+Pause/resume uses multiple segments. Each segment is muxed and then concatenated; paused recordings take longer to save.
 
-The direct output is a standard (non-fragmented) MP4. Fragmented MP4 played poorly in some Windows players, showing a still image at fragment boundaries; standard MP4 also carries the `mvhd` duration that Windows Explorer displays in the **Length** column.
+The output is a standard (non-fragmented) MP4 with the `mvhd` duration, so Windows Explorer shows the **Length** column.
 
 ## How it works
 
 - Python 3.11 + Tkinter UI.
-- Single-audio recordings use x264 ultrafast + gdigrab and write MP4 directly; no-audio / system+mic recordings use `ddagrab`+QSV MKV with `gdigrab`/x264 fallbacks, 720P.
+- Single-audio recordings use `ddagrab`+QSV for smooth video and a separate AAC process; no-audio / system+mic recordings use the MKV path with `gdigrab`/x264 fallbacks, 720P.
 - PyAudioWPatch / PortAudio WASAPI loopback for system sound, plus optional microphone. A callback stream feeds live 48 kHz PCM to the direct MP4 encoder; the MKV path writes WAV segments.
 - Pause/resume creates numbered segments. Direct-MP4 segments are concatenated only if pause was used; uninterrupted recordings are finalized in place.
 - An independent watchdog thread enforces `stop_at`, so auto-stop works even if the UI is briefly busy. The end mode can be changed live between automatic and manual.
@@ -148,7 +153,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 Output:
 
 - `dist\RecordOnTime\RecordOnTime.exe`
-- `dist\RecordOnTime_v1.1.10_win64.zip`
+- `dist\RecordOnTime_v1.2.0_win64.zip`
 
 The PyInstaller spec is `RecordOnTime.spec`; FFmpeg is bundled as `vendor\ffmpeg.exe` (not embedded into the EXE) for fast startup. The binary is not committed to Git; `build.ps1` fetches it via `imageio-ffmpeg`, and the release ZIP includes it.
 

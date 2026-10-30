@@ -16,13 +16,14 @@ from pathlib import Path
 from .audio import AudioCapture, AudioError, SilentKeepAlive, find_microphone, list_audio_devices
 from .config import AUDIO_BOTH, AUDIO_MIC, AUDIO_NONE, AUDIO_SYSTEM, RecordingConfig
 from .ffmpeg import (
+    AacAudioRecorder,
     AudioTrack,
-    DirectRecorder,
     FFmpegError,
     VideoRecorder,
     concat_mp4,
     find_ffmpeg,
     mux_recording,
+    mux_video_audio_copy,
     patch_mp4_duration,
     probe_media,
 )
@@ -47,6 +48,7 @@ class SegmentResult:
     video_started_at: datetime
     captures: list[AudioCapture] = field(default_factory=list)
     direct: bool = False
+    audio_path: Path | None = None
 
     @property
     def duration(self) -> float:
@@ -70,10 +72,11 @@ class RecordingEngine:
         self._watch_thread: threading.Thread | None = None
         self._watch_stop = threading.Event()
         self._finishing = False
-        self._video: VideoRecorder | DirectRecorder | None = None
+        self._video: VideoRecorder | None = None
         self._audio: list[AudioCapture] = []
         self._keepalive: SilentKeepAlive | None = None
         self._direct_enabled = True
+        self._audio_recorder: AacAudioRecorder | None = None
         self._segments: list[SegmentResult] = []
         self._segment_index = 0
         self._segment_active_started: float | None = None
@@ -173,6 +176,7 @@ class RecordingEngine:
             self._video = None
             self._audio = []
             self._direct_enabled = True
+            self._audio_recorder = None
             self._keepalive = None
             self._segments = []
             self._segment_index = 0
@@ -295,17 +299,30 @@ class RecordingEngine:
             # two simultaneous PyAudio instances plus the live encoder can
             # destabilise some WASAPI drivers.
             self._keepalive = None
-        recorder = DirectRecorder(
+        video = VideoRecorder(
             config,
-            session_dir / f"direct_{index:03d}.mp4",
-            capture,
+            session_dir / f"direct_video_{index:03d}.mp4",
             ffmpeg=ffmpeg,
+            container="mp4",
         )
+        audio_rec = None
         try:
-            recorder.start()
+            video.start()
+            audio_rec = AacAudioRecorder(
+                capture,
+                session_dir / f"direct_audio_{index:03d}.m4a",
+                video_start=video.started_monotonic or time.monotonic(),
+                ffmpeg=ffmpeg,
+            )
+            audio_rec.start()
         except Exception:
+            if audio_rec is not None:
+                try:
+                    audio_rec.stop(timeout=3)
+                except Exception:
+                    pass
             try:
-                recorder.stop(timeout=3)
+                video.stop(timeout=5)
             except Exception:
                 pass
             capture.close()
@@ -313,12 +330,13 @@ class RecordingEngine:
                 self._keepalive.stop()
                 self._keepalive = None
             raise
-        self._video = recorder
+        self._video = video
         self._audio = [capture]
-        self._segment_active_started = recorder.started_monotonic or time.monotonic()
+        self._audio_recorder = audio_rec
+        self._segment_active_started = video.started_monotonic or time.monotonic()
         if self._started_at is None:
             self._started_at = (
-                datetime.fromtimestamp(recorder.started_at) if recorder.started_at else datetime.now()
+                datetime.fromtimestamp(video.started_at) if video.started_at else datetime.now()
             )
         if self._started_monotonic is None:
             self._started_monotonic = self._segment_active_started
@@ -425,8 +443,19 @@ class RecordingEngine:
                 return None
             captures = list(self._audio)
             self._audio = []
-            direct = isinstance(video, DirectRecorder)
-            if not direct:
+            direct = self._audio_recorder is not None
+            audio_rec = self._audio_recorder
+            if direct:
+                try:
+                    audio_rec.stop(timeout=8)
+                except Exception:
+                    _LOG.exception("AAC audio stop failed")
+                for capture in captures:
+                    try:
+                        capture.abort()
+                    except Exception:
+                        pass
+            else:
                 for capture in captures:
                     try:
                         capture.stop()
@@ -445,6 +474,7 @@ class RecordingEngine:
                 except Exception as exc:
                     self._add_warning(f"当前片段保存失败：{exc}")
             self._video = None
+            self._audio_recorder = None
             self._segment_active_started = None
 
             if video is not None and video.output.exists() and video.output.stat().st_size >= 1024:
@@ -458,7 +488,10 @@ class RecordingEngine:
                     video_started_monotonic=start,
                     video_started_at=started_at,
                     captures=captures,
-                    direct=isinstance(video, DirectRecorder),
+                    direct=direct,
+                    audio_path=audio_rec.output
+                    if audio_rec is not None and audio_rec.output.exists()
+                    else None,
                 )
                 self._segments.append(segment)
                 self._accumulated_active += max(0.0, time.monotonic() - start)
@@ -596,13 +629,37 @@ class RecordingEngine:
             final_path = unique_path(config.output_dir, config.output_stem(self._started_at))
             if segments and all(segment.direct for segment in segments):
                 if len(segments) == 1:
-                    # Same-volume rename: the MP4 was finalised by FFmpeg at
-                    # stop, so there is no remux or copy to wait for.
-                    shutil.move(str(segments[0].video_path), str(final_path))
+                    segment = segments[0]
+                    if segment.audio_path is not None:
+                        mux_video_audio_copy(
+                            self._ffmpeg or find_ffmpeg(),
+                            segment.video_path,
+                            segment.audio_path,
+                            final_path,
+                            timeout=max(120.0, max(1.0, self._accumulated_active) * 2),
+                        )
+                    else:
+                        shutil.move(str(segment.video_path), str(final_path))
                 else:
+                    muxed: list[Path] = []
+                    for segment in segments:
+                        if segment.audio_path is None:
+                            muxed.append(segment.video_path)
+                            continue
+                        part = segment.video_path.with_name(
+                            f"direct_mux_{segment.index:03d}.mp4"
+                        )
+                        mux_video_audio_copy(
+                            self._ffmpeg or find_ffmpeg(),
+                            segment.video_path,
+                            segment.audio_path,
+                            part,
+                            timeout=max(120.0, max(1.0, self._accumulated_active) * 2),
+                        )
+                        muxed.append(part)
                     concat_mp4(
                         self._ffmpeg or find_ffmpeg(),
-                        [segment.video_path for segment in segments],
+                        muxed,
                         final_path,
                         timeout=max(120.0, max(1.0, self._accumulated_active) * 2),
                     )
