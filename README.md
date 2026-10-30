@@ -6,7 +6,7 @@ A 720P Windows screen recorder with **scheduled start**, **scheduled stop**, **p
 
 中文界面：[screenshots/ui_zh.png](screenshots/ui_zh.png)
 
-**Download:** [RecordOnTime_v1.1.7_win64.zip](dist/RecordOnTime_v1.1.7_win64.zip) (local build)
+**Download:** [RecordOnTime_v1.1.8_win64.zip](dist/RecordOnTime_v1.1.8_win64.zip) (local build)
 
 ## Highlights
 
@@ -21,7 +21,7 @@ A 720P Windows screen recorder with **scheduled start**, **scheduled stop**, **p
 
 ## Quick start
 
-1. Download [RecordOnTime_v1.1.7_win64.zip](dist/RecordOnTime_v1.1.7_win64.zip) and extract the whole folder.
+1. Download [RecordOnTime_v1.1.8_win64.zip](dist/RecordOnTime_v1.1.8_win64.zip) and extract the whole folder.
 2. Run `RecordOnTime.exe`.
 3. Choose a display, audio source and output folder.
 4. Pick **Now** or **Scheduled**, set **Duration / End time / Manual**, then click the red button.
@@ -83,7 +83,7 @@ Top-right **Menu**:
 | Item | Value |
 |---|---|
 | Container | MP4 (standard, no faststart — finalizes much faster) |
-| Video | H.264 High Profile, 1280×720, 30 FPS; Desktop Duplication + QSV (fallbacks: gdigrab/QSV, x264 ultrafast) |
+| Video | H.264 High Profile, 1280×720, 30 FPS; direct path x264 ultrafast, other paths Desktop Duplication + QSV |
 | Audio | AAC-LC 48 kHz stereo 192 kbps (Windows Media Foundation encoder, native fallback) |
 | Aspect ratio | Preserved, letterboxed to exactly 1280×720 |
 | Temporary format | MKV segments while recording; MP4 when finished |
@@ -92,18 +92,18 @@ Recordings go to the selected folder (default `%USERPROFILE%\Videos\RecordOnTime
 
 ### Recording CPU
 
-The old encoder was libx264 `veryfast` (CRF 19) and could exceed 20–25% CPU. v1.1.7 records single-audio-source sessions directly to MP4 with **Media Foundation H.264 (`h264_mf`) + gdigrab**:
+The old encoder was libx264 `veryfast` (CRF 19) and could exceed 20–25% CPU. v1.1.8 records single-audio-source sessions directly to MP4 with **x264 ultrafast (CRF 23) + gdigrab**:
 
-- measured recording CPU on this machine: about **9%**, down from 20–25%;
-- output is 1280×720 H.264 at 30 FPS;
+- measured recording CPU on this machine: about **2%**, down from 20–25%;
+- output is 1280×720 H.264 at 30 FPS, with a similar file size (about 1 GB for two hours of lecture content);
 - no audio or system+microphone recordings still use the MKV path with Desktop Duplication/QSV (about 1–2%), but need post-processing;
-- Desktop Duplication cannot be combined with the live PCM input used by the direct-MP4 path on this driver (QSV surface allocation failure), so it is not used there.
+- QSV cannot be combined with the live PCM input on this driver (it either throttles frames or fails surface allocation), so the direct path uses x264 ultrafast.
 
 ### Saving speed
 
-The direct-MP4 path needs **no post-recording mux**: FFmpeg writes the final MP4 while recording, so stopping only finalises the MP4 index and renames the file. Measured **0.4–0.6 seconds** after stop, including probing and cleanup. This applies to uninterrupted single-audio recordings, including 2-hour files.
+The direct-MP4 path needs **no post-recording mux**: FFmpeg writes the final fragmented MP4 while recording, so stopping only closes the current fragment and renames the file. Measured **0.7–1.2 seconds** after stop, including probing and cleanup. This applies to uninterrupted single-audio recordings, including 2-hour files.
 
-For the fallback MKV path (system + microphone, or direct capture unavailable), v1.1.7 still uses parallel AAC chunks:
+For the fallback MKV path (system + microphone, or direct capture unavailable), v1.1.8 still uses parallel AAC chunks:
 
 - audio uses **Windows Media Foundation AAC (`aac_mf`)** (native AAC with `-aac_coder fast` as fallback);
 - for single-track recordings of **1 hour or longer**, up to four audio chunks are encoded in parallel and concatenated with `-c:a copy`;
@@ -114,7 +114,7 @@ Pause/resume uses multiple segments. Paused recordings still need a final concat
 ## How it works
 
 - Python 3.11 + Tkinter UI.
-- Single-audio recordings use `h264_mf` + gdigrab and write MP4 directly; no-audio / system+mic recordings use `ddagrab`+QSV MKV with `gdigrab`/x264 fallbacks, 720P.
+- Single-audio recordings use x264 ultrafast + gdigrab and write MP4 directly; no-audio / system+mic recordings use `ddagrab`+QSV MKV with `gdigrab`/x264 fallbacks, 720P.
 - PyAudioWPatch / PortAudio WASAPI loopback for system sound, plus optional microphone. A callback stream feeds live 48 kHz PCM to the direct MP4 encoder; the MKV path writes WAV segments.
 - Pause/resume creates numbered segments. Direct-MP4 segments are concatenated only if pause was used; uninterrupted recordings are finalized in place.
 - An independent watchdog thread enforces `stop_at`, so auto-stop works even if the UI is briefly busy. The end mode can be changed live between automatic and manual.
@@ -146,7 +146,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 Output:
 
 - `dist\RecordOnTime\RecordOnTime.exe`
-- `dist\RecordOnTime_v1.1.7_win64.zip`
+- `dist\RecordOnTime_v1.1.8_win64.zip`
 
 The PyInstaller spec is `RecordOnTime.spec`; FFmpeg is bundled as `vendor\ffmpeg.exe` (not embedded into the EXE) for fast startup. The binary is not committed to Git; `build.ps1` fetches it via `imageio-ffmpeg`, and the release ZIP includes it.
 

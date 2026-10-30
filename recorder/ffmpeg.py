@@ -8,6 +8,7 @@ import os
 import queue
 import re
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -316,6 +317,7 @@ def build_direct_command(
     config: RecordingConfig,
     output: Path,
     *,
+    audio_input: str,
     audio_rate: int,
     audio_channels: int,
     noise_reduction: bool,
@@ -359,7 +361,7 @@ def build_direct_command(
         "-ac",
         str(audio_channels),
         "-i",
-        "pipe:0",
+        audio_input,
         "-map",
         "0:v:0",
         "-map",
@@ -382,7 +384,9 @@ def build_direct_command(
     )
     if aac == "aac":
         command.extend(["-aac_coder", "fast"])
-    command.extend(["-shortest", "-f", "mp4", str(output)])
+    command.extend(
+        ["-movflags", "+frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", str(output)]
+    )
     return command
 
 
@@ -408,19 +412,11 @@ class DirectRecorder:
         self.output = Path(output)
         self.capture = capture
         self.ffmpeg = ffmpeg or find_ffmpeg()
-        base_encoder = encoder or select_video_encoder(self.ffmpeg)
-        # QSV plus a live PCM input hits a QSV/filter memory allocation bug on
-        # some drivers.  Use MF's H.264 encoder for the direct path; normal MKV
-        # recording keeps using QSV.
-        if base_encoder == "h264_qsv" and not os.environ.get("SCREEN_RECORDER_DIRECT_QSV"):
-            base_encoder = "h264_mf"
-        self.encoder = base_encoder
-        if os.environ.get("SCREEN_RECORDER_DIRECT_GDI"):
-            self.source = "gdigrab"
-        else:
-            self.source = source or (
-                "ddagrab" if self.encoder == "h264_qsv" and _can_ddagrab(config) else "gdigrab"
-            )
+        # The direct path uses x264 ultrafast: it measured ~2% CPU while still
+        # writing an MP4 with the same 3M-class bitrate.  QSV+live audio is
+        # throttled/unsupported on this driver.
+        self.encoder = encoder or "libx264"
+        self.source = source or "gdigrab"
         self.process: subprocess.Popen | None = None
         self.command: list[str] = []
         self.started_monotonic: float | None = None
@@ -428,6 +424,9 @@ class DirectRecorder:
         self._stderr: deque[str] = deque(maxlen=120)
         self._reader: threading.Thread | None = None
         self._writer: threading.Thread | None = None
+        self._acceptor: threading.Thread | None = None
+        self._server: socket.socket | None = None
+        self._conn: socket.socket | None = None
         self._stderr_lock = threading.Lock()
         self._queue: queue.Queue[bytes] = queue.Queue(maxsize=2000)
         self._stop = threading.Event()
@@ -442,10 +441,17 @@ class DirectRecorder:
 
     def start(self) -> None:
         self.output.parent.mkdir(parents=True, exist_ok=True)
+        self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._server.bind(("127.0.0.1", 0))
+        self._server.listen(1)
+        self._server.settimeout(10.0)
+        port = self._server.getsockname()[1]
         self.command = build_direct_command(
             self.ffmpeg,
             self.config,
             self.output,
+            audio_input=f"tcp://127.0.0.1:{port}",
             audio_rate=self.capture.sample_rate,
             audio_channels=self.capture.channels,
             noise_reduction=self.capture.noise_reduction,
@@ -467,14 +473,30 @@ class DirectRecorder:
         self._reader = threading.Thread(target=self._read_stderr, name="direct-stderr", daemon=True)
         self._reader.start()
         self.capture.start()
-        self._writer = threading.Thread(target=self._write_audio, name="direct-audio", daemon=True)
-        self._writer.start()
+        self._acceptor = threading.Thread(target=self._accept_audio, name="direct-accept", daemon=True)
+        self._acceptor.start()
         time.sleep(0.7)
         code = self.process.poll()
         if code is not None:
             self._reader.join(timeout=1.0)
             detail = self.error_text()
             raise FFmpegError(f"直接录制启动失败（FFmpeg 退出码 {code}）。{detail}")
+
+    def _accept_audio(self) -> None:
+        server = self._server
+        if server is None:
+            return
+        try:
+            conn, _ = server.accept()
+            conn.settimeout(None)
+            self._conn = conn
+            self._writer = threading.Thread(
+                target=self._write_audio, args=(conn,), name="direct-audio", daemon=True
+            )
+            self._writer.start()
+        except Exception as exc:
+            if not self._stop.is_set():
+                _LOG.warning("Direct audio TCP accept failed: %s", exc)
 
     def _read_stderr(self) -> None:
         stream = self.process.stderr if self.process else None
@@ -489,8 +511,7 @@ class DirectRecorder:
         except Exception:
             pass
 
-    def _write_audio(self) -> None:
-        assert self.process is not None and self.process.stdin is not None
+    def _write_audio(self, conn: socket.socket) -> None:
         rate = max(1, self.capture.sample_rate)
         channels = max(1, self.capture.channels)
         frame_bytes = 2 * channels
@@ -516,12 +537,12 @@ class DirectRecorder:
                     if len(chunk) <= drop:
                         drop -= len(chunk)
                     else:
-                        self.process.stdin.write(chunk[drop:])
+                        conn.sendall(chunk[drop:])
                         drop = 0
             if base_bytes:
                 silence = b"\x00" * base_bytes
                 for start in range(0, len(silence), 65536):
-                    self.process.stdin.write(silence[start : start + 65536])
+                    conn.sendall(silence[start : start + 65536])
             written = base_bytes
             wall_start = time.monotonic()
             bytes_per_second = rate * frame_bytes
@@ -530,17 +551,17 @@ class DirectRecorder:
                     data = self._queue.get_nowait()
                 except queue.Empty:
                     # Idle WASAPI loopback can stop producing packets.  Feed
-                    # real-time silence so -shortest does not end the video.
+                    # real-time silence to keep the audio clock moving.
                     target = int((time.monotonic() - wall_start) * bytes_per_second) + base_bytes
                     if target > written:
                         pad = min(target - written, bytes_per_second // 20)
                         pad -= pad % frame_bytes
                         if pad > 0:
-                            self.process.stdin.write(b"\x00" * pad)
+                            conn.sendall(b"\x00" * pad)
                             written += pad
                     time.sleep(0.01)
                 else:
-                    self.process.stdin.write(data)
+                    conn.sendall(data)
                     written += len(data)
         except (BrokenPipeError, OSError, ValueError) as exc:
             if not self._stop.is_set():
@@ -549,7 +570,7 @@ class DirectRecorder:
             _LOG.exception("Unexpected direct audio writer failure")
         finally:
             try:
-                self.process.stdin.close()
+                conn.close()
             except Exception:
                 pass
 
@@ -570,7 +591,8 @@ class DirectRecorder:
         if process is not None:
             try:
                 if process.stdin is not None:
-                    process.stdin.close()
+                    process.stdin.write(b"q\n")
+                    process.stdin.flush()
             except Exception:
                 pass
             try:
@@ -581,6 +603,14 @@ class DirectRecorder:
                     process.wait(timeout=2)
                 except Exception:
                     process.kill()
+        for sock in (self._conn, self._server):
+            try:
+                if sock is not None:
+                    sock.close()
+            except Exception:
+                pass
+        self._conn = None
+        self._server = None
         if self._writer is not None:
             self._writer.join(timeout=1.0)
         try:
