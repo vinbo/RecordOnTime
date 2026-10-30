@@ -9,6 +9,7 @@ import queue
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import threading
 import time
@@ -1356,3 +1357,100 @@ def decode_check(path: Path, ffmpeg: Path | None = None) -> bool:
         timeout=120,
     )
     return code == 0
+
+
+def _iter_boxes(buf: bytes | bytearray, start: int, end: int):
+    pos = start
+    while pos + 8 <= end:
+        size, kind = struct.unpack(">I4s", buf[pos : pos + 8])
+        header = 8
+        if size == 1:
+            if pos + 16 > end:
+                break
+            size = struct.unpack(">Q", buf[pos + 8 : pos + 16])[0]
+            header = 16
+        elif size == 0:
+            size = end - pos
+        if size < header or pos + size > end:
+            break
+        yield pos, size, header, kind.decode("latin1")
+        pos += size
+
+
+def patch_mp4_duration(path: Path, duration: float) -> None:
+    """Write the movie duration into a fragmented MP4's moov boxes.
+
+    FFmpeg's empty_moov fragmentation leaves mvhd/tkhd/mdhd durations at zero.
+    Players derive the duration from fragments, but Windows Explorer's
+    System.Media.Duration property reads mvhd and shows a blank Length column.
+    Patch only the small moov box in place; no media data is rewritten.
+    """
+    if duration <= 0:
+        return
+    with open(path, "r+b") as stream:
+        file_size = path.stat().st_size
+        pos = 0
+        moov = None
+        while pos + 8 <= file_size:
+            stream.seek(pos)
+            head = stream.read(16)
+            size, kind = struct.unpack(">I4s", head[:8])
+            header = 8
+            if size == 1:
+                size = struct.unpack(">Q", head[8:16])[0]
+                header = 16
+            elif size == 0:
+                size = file_size - pos
+            if size < header:
+                break
+            if kind == b"moov":
+                moov = (pos, size, header)
+                break
+            pos += size
+        if moov is None:
+            return
+        offset, size, header = moov
+        stream.seek(offset)
+        data = bytearray(stream.read(size))
+        movie_timescale = 1000
+        for p, s, h, kind in _iter_boxes(data, header, size):
+            if kind == "mvhd":
+                payload = p + h
+                version = data[payload]
+                ts_off = payload + (12 if version == 0 else 20)
+                dur_off = payload + (16 if version == 0 else 24)
+                movie_timescale = struct.unpack(">I", data[ts_off : ts_off + 4])[0] or 1000
+                value = min(round(duration * movie_timescale), 0xFFFFFFFF)
+                struct.pack_into(">I", data, dur_off, value)
+                break
+        for p, s, h, kind in _iter_boxes(data, header, size):
+            payload = p + h
+            if kind == "tkhd":
+                version = data[payload]
+                dur_off = payload + (20 if version == 0 else 28)
+                value = min(round(duration * movie_timescale), 0xFFFFFFFF)
+                struct.pack_into(">I", data, dur_off, value)
+            elif kind == "trak":
+                for p2, s2, h2, kind2 in _iter_boxes(data, p + h, p + s):
+                    if kind2 != "mdia":
+                        continue
+                    for p3, s3, h3, kind3 in _iter_boxes(data, p2 + h2, p2 + s2):
+                        if kind3 != "mdhd":
+                            continue
+                        payload3 = p3 + h3
+                        version = data[payload3]
+                        ts_off = payload3 + (12 if version == 0 else 20)
+                        dur_off = payload3 + (16 if version == 0 else 24)
+                        timescale = struct.unpack(">I", data[ts_off : ts_off + 4])[0] or 1
+                        value = min(round(duration * timescale), 0xFFFFFFFF)
+                        struct.pack_into(">I", data, dur_off, value)
+            elif kind == "mvex":
+                for p2, s2, h2, kind2 in _iter_boxes(data, p + h, p + s):
+                    if kind2 != "mehd":
+                        continue
+                    payload2 = p2 + h2
+                    version = data[payload2]
+                    value = min(round(duration * movie_timescale), 0xFFFFFFFF)
+                    struct.pack_into(">I", data, payload2 + 4, value)
+        stream.seek(offset)
+        stream.write(data)

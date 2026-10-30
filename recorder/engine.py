@@ -23,6 +23,7 @@ from .ffmpeg import (
     concat_mp4,
     find_ffmpeg,
     mux_recording,
+    patch_mp4_duration,
     probe_media,
 )
 from .util import format_hms, unique_path, work_dir
@@ -608,6 +609,7 @@ class RecordingEngine:
                 info = probe_media(final_path)
                 if not info.video_codec or info.width <= 0:
                     raise FFmpegError("最终文件缺少有效的视频轨道")
+                patch_mp4_duration(final_path, info.duration)
                 self._finished_at = datetime.now()
                 self._cleanup_session_dir()
                 finalize_seconds = time.monotonic() - finalize_started
